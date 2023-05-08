@@ -6,13 +6,13 @@
 HDRS=serAdvect.h parAdvect.h
 OBJS=serAdvect.o parAdvect.o
 PROG=testAdvect
-CCFLAGS=-O3 -fopenmp
+CCFLAGS=-O3 -fopenmp -Wattributes -Wall
 
 all: $(PROG) 
 
 %: %.o $(OBJS)
-	gcc-12 -o $* $*.o $(OBJS) -lgomp -lm
+	gcc-13 -o $* $*.o $(OBJS) -lgomp -lm
 %.o: %.c $(HDRS)
-	gcc-12 -Wall $(CCFLAGS) -c $*.c
+	gcc-13 -Wall $(CCFLAGS) -c $*.c
 clean:
 	rm -f *.o $(PROG)
