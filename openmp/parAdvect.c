@@ -21,12 +21,12 @@ void initParParams(int M_, int N_, int P_, int Q_, int verb) {
 
 __attribute__((always_inline)) static inline void omp1dUpdateBoundary(double *u, int ldu) {
 	int i, j;
-#pragma omp for private(j)
+	#pragma omp for private(j)
 	for (j = 1; j < N+1; j++) { //top and bottom halo
 		V(u, 0, j)   = V(u, M, j);
 		V(u, M+1, j) = V(u, 1, j);
 	}
-#pragma omp for private(i)
+	#pragma omp for private(i)
 	for (i = 0; i < M+2; i++) { //left and right sides of halo 
 		V(u, i, 0) = V(u, i, N);
 		V(u, i, N+1) = V(u, i, 1);
@@ -39,7 +39,7 @@ __attribute__((always_inline)) static inline void omp1dUpdateAdvectField(double 
 	double Ux = Velx * dt / deltax, Uy = Vely * dt / deltay;
 	double cim1, ci0, cip1, cjm1, cj0, cjp1;
 	N2Coeff(Ux, &cim1, &ci0, &cip1); N2Coeff(Uy, &cjm1, &cj0, &cjp1);
-#pragma omp for private(i,j) collapse(2)
+	#pragma omp for private(i,j) collapse(2)
 	for (i=0; i < M; i++)
 		for (j=0; j < N; j++) 
 			V(v,i,j) =
@@ -51,7 +51,7 @@ __attribute__((always_inline)) static inline void omp1dUpdateAdvectField(double 
 
 __attribute__((always_inline)) static inline void omp1dCopyField(double *v, int ldv, double *u, int ldu) {
 	int i, j;
-#pragma omp for private(i,j) collapse(2)
+	#pragma omp for private(i,j) collapse(2)
 	for (i=0; i < M; i++)
 		for (j=0; j < N; j++)
 			V(u,i,j) = V(v,i,j);
@@ -64,7 +64,7 @@ void omp1dAdvect(int reps, double *u, int ldu) {
 	int ldv = N+2;
 	double *v = calloc(ldv*(M+2), sizeof(double)); assert(v != NULL);
 	for (int r = 0; r < reps; r++) {    
-#pragma omp parallel shared(u,ldu,v,ldv)
+		#pragma omp parallel shared(u,ldu,v,ldv)
 		{
 			omp1dUpdateBoundary(u, ldu);
 			omp1dUpdateAdvectField(&V(u,1,1), ldu, &V(v,1,1), ldv);
@@ -190,7 +190,8 @@ typedef void(*ExchangeHandler)(EXCHANGE_PARAMS);
 // ... using 2D parallelization
 void omp2dAdvect(int reps, double *u, int ldu) {
 	size_t i, j, r, ldv = N+2;
-	double *v = calloc(ldv*(M+2), sizeof(double)); assert(v != NULL);
+	double *v = calloc(ldv * (M + 2), sizeof(*v));
+	assert(v != NULL);
 
 	for (r = 0; r < reps; r++) {
 		#pragma omp parallel for shared(u, ldu, v, ldv) private(i, j) collapse(2)
