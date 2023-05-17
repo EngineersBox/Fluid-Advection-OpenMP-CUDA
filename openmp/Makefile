@@ -6,12 +6,18 @@
 HDRS=serAdvect.h parAdvect.h
 OBJS=serAdvect.o parAdvect.o
 PROG=testAdvect
-CCFLAGS=-O3 -fopenmp -Wattributes -Wall
+FFT_CONV_KERNEL=0
+CCFLAGS=-O3 -fopenmp -Wattributes -Wall -DFFT_CONV_KERNEL=$(FFT_CONV_KERNEL)
+LINKERFLAGS=
+
+ifeq ($(FFT_CONV_KERNEL), 1)
+	LINKERFLAGS=$(shell pkg-config --cflags --libs fftw3)
+endif
 
 all: $(PROG) 
 
 %: %.o $(OBJS)
-	gcc-13 -o $* $*.o $(OBJS) -lgomp -lm
+	gcc-13 -o $* $*.o $(OBJS) $(LINKERFLAGS) -lgomp -lm
 %.o: %.c $(HDRS)
 	gcc-13 -Wall $(CCFLAGS) -c $*.c
 clean:
