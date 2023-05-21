@@ -39,7 +39,7 @@
 #endif
 
 #ifndef LOG_2D_EXCHANGES
-#define LOG_2D_EXCHANGES 1
+#define LOG_2D_EXCHANGES 0
 #endif
 
 #ifndef SWAP_BUFFERS
@@ -108,13 +108,12 @@ STATIC_INLINE void omp1dUpdateBoundary(mat2 u, int ldu) {
 	}
 } 
 
-
 STATIC_INLINE void omp1dUpdateAdvectField(mat2_r u, int ldu, mat2_r v, int ldv) {
 	int i, j;
 	double Ux = Velx * dt / deltax, Uy = Vely * dt / deltay;
 	double cim1, ci0, cip1, cjm1, cj0, cjp1;
 	N2Coeff(Ux, &cim1, &ci0, &cip1); N2Coeff(Uy, &cjm1, &cj0, &cjp1);
-	#pragma omp for private(i,j) collapse(2)
+	#pragma omp for private(i)
 	for_ru (i, 0, M)
 		for_ru (j, 0, N) 
 			V(v,i,j) =
@@ -123,15 +122,13 @@ STATIC_INLINE void omp1dUpdateAdvectField(mat2_r u, int ldu, mat2_r v, int ldv) 
 				cip1*(cjm1*V(u,i+1,j-1) + cj0*V(u,i+1,j) + cjp1*V(u,i+1,j+1));
 } //omp1dUpdateAdvectField()  
 
-
 STATIC_INLINE void omp1dCopyField(mat2_r v, int ldv, mat2_r u, int ldu) {
 	int i, j;
-	#pragma omp for private(i,j) collapse(2)
+	#pragma omp for private(i)
 	for_ru (i, 0, M)
 		for_ru (j, 0, N)
 			V(u,i,j) = V(v,i,j);
 } //omp1dCopyField()
-
 
 // evolve advection over reps timesteps, with (u,ldu) containing the field
 // using 1D parallelization
@@ -229,7 +226,7 @@ void exchangeBlockCorner(EXCHANGE_PARAMS) {
 				modAlt(verticalCond, 0, M + 1),
 				modAlt(horizontalCond, 0, N + 1)
 		);
-	)
+	);
 	V(u, modAlt(verticalCond, 0, M + 1), modAlt(horizontalCond, 0, N + 1)) = V(u, modAlt(verticalCond, M, 1), modAlt(horizontalCond, N, 1));
 	// Exchange top or bottom
 	size_t yDst = modAlt(verticalCond, 0, M + 1);
@@ -241,7 +238,7 @@ void exchangeBlockCorner(EXCHANGE_PARAMS) {
 			yDst, ySrc,
 			N0, N0 + N_loc
 		);
-	)
+	);
 	for_rc (x, N0, N_loc) {
 		V(u, yDst, x) = V(u, ySrc, x);
 	}
@@ -255,7 +252,7 @@ void exchangeBlockCorner(EXCHANGE_PARAMS) {
 			xDst, xSrc,
 			M0, M0 + M_loc
 		);
-	)
+	);
 	for_rc (y, M0, M_loc) {
 		V(u, y, xDst) = V(u, y, xSrc);
 	}
@@ -274,7 +271,7 @@ void exchangeBlockTopBottom(EXCHANGE_PARAMS) {
 			yDst, ySrc,
 			N0, N0 + N_loc
 		);
-	)
+	);
 	for_rc (x, N0, N_loc) {
 		V(u, yDst, x) = V(u, ySrc, x);
 	}
@@ -293,7 +290,7 @@ void exchangeBlockLeftRight(EXCHANGE_PARAMS) {
 			xDst, xSrc,
 			M0, M0 + M_loc
 		);
-	)
+	);
 	for_rc (y, M0, M_loc) {
 		V(u, y, xDst) = V(u, y, xSrc);
 	}
@@ -341,12 +338,12 @@ void omp2dAdvect(int reps, mat2 u, int ldu) {
 						(void*) ((uintptr_t) (topBottom != exchangeNoop) * (uintptr_t) topBottom),
 						(void*) ((uintptr_t) (leftRight != exchangeNoop) * (uintptr_t) leftRight)
 					);
-				)
+				);
 				updateAdvectField(M_loc, N_loc, &V(u, M0, N0), ldu, &V(v, M0, N0), ldv);
 				COMPILE_COND_F(SWAP, copyField(M_loc, N_loc, &V(v, M0, N0), ldv, &V(u, M0, N0), ldu));
 			}
 		}
-		COMPILE_COND_T(SWAP, swap(u, v, double*));
+		COMPILE_COND_T(SWAP, swap(u, v, mat2));
 	} //for (r...)
 	COMPILE_COND_T(SWAP,
 		if (reps % 2 != 0) {
@@ -373,35 +370,36 @@ void convolution_fftw_2d(mat2_r real, mat2_r input, mat2_r result) {
 	fft_forward(real,a_complex,n_formula);
 	bool is_initialised = false;
 	int t;
+	size_t i;
 	while (t > 1) {
 		if (t & 1) {
 			if (!is_initialised) {
 				memcpy(odd_mults, a_complex, n_formula * n_formula);
 				is_initialised = true;
 			} else {
-				#pragma omp parallel for
-				for (size_t i = 0; i < n_formula * n_formula; i++) {
+				#pragma omp for private(i)
+				for (i = 0; i < n_formula * n_formula; i++) {
 					odd_mults[i] = odd_mults[i] * a_complex[i];
 				}
 			}
 		}
-		#pragma omp parallel for
-		for (size_t i = 0; i < n_formula * n_formula; i++) {
+		#pragma omp for private(i)
+		for (i = 0; i < n_formula * n_formula; i++) {
 			a_complex[i] = a_complex[i] * a_complex[i];
 		}
 		t /= 2;
 	}
 	if (is_initialised) {
-		#pragma omp parallel for
-		for (size_t i  = 0; i < n_formula * n_formula; i++) {
+		#pragma omp for private(i)
+		for (i  = 0; i < n_formula * n_formula; i++) {
 			a_complex[i] = a_complex[i] * odd_mults[i];
 		}
 	}
 
 	fft_forward(input, input_complex, N);
 
-	#pragma omp parallel for
-	for (size_t i = 0; i < N * N; i++) {
+	#pragma omp for private(i)
+	for (i = 0; i < N * N; i++) {
 		a_complex[i] = input_complex[i] * a_complex[i];
 	}
 
@@ -411,6 +409,81 @@ void convolution_fftw_2d(mat2_r real, mat2_r input, mat2_r result) {
 #endif
 
 // ... extra optimization variant
-void ompAdvectExtra(int reps, mat2 u, int ldu) {
+void ompAdvectExtra(int r, mat2 u, int ldu) {
+#if FFT_CONV_KERNEL == 1
+	int timesteps = r;
+	fftw_complex* a_complex = (fftw_complex*) fftw_alloc_complex(M * N);
 
+	assert(a_complex != NULL);
+	memset(a_complex, 0, sizeof(fftw_complex) * M * N);
+	fftw_plan plan_u_f = fftw_plan_dft_r2c_2d(M, N, u, a_complex, FFTW_ESTIMATE);
+	fftw_execute(plan_u_f);
+	fftw_destroy_plan(plan_u_f);
+
+	fftw_complex* tempSquaring = (fftw_complex*) fftw_alloc_complex(M_loc * N_loc);
+	memset(tempSquaring, 0, M_loc * N_loc * sizeof(*tempSquaring));
+	/*MPI_Scatter(*/
+			/*a_complex, 1, matSegType,*/
+			/*tempSquaring, 1, matSegType,*/
+			/*0, commHandle*/
+	/*);*/
+	#pragma omp parallel
+	{
+		repeatedSquaring(timesteps, tempSquaring, M_loc * N_loc);
+		/*MPI_Gather(*/
+			/*tempSquaring, 1, matSegType,*/
+			/*a_complex, 1, matSegType,*/
+			/*0, commHandle*/
+		/*);*/
+		fftw_free(tempSquaring);
+
+		fftw_complex* input_complex = (fftw_complex*) fftw_alloc_complex(M * N);
+		fftw_plan plan_lwk_f = fftw_plan_dft_r2c_2d(M, N, laxWendroffKernel, input_complex, FFTW_ESTIMATE);
+		fftw_execute(plan_lwk_f);
+		fftw_destroy_plan(plan_lwk_f);
+
+		tempSquaring = (fftw_complex*) fftw_alloc_complex(M_loc * N_loc);
+		fftw_complex* tempComplex = (fftw_complex*) fftw_alloc_complex(M_loc * N_loc);
+		memset(tempSquaring, 0, M_loc * N_loc * sizeof(*tempSquaring));
+		memset(tempComplex, 0, M_loc * N_loc * sizeof(*tempComplex));
+		/*MPI_Iscatter(*/
+				/*a_complex, 1, matSegType,*/
+				/*tempSquaring, 1, matSegType,*/
+				/*0, commHandle, &requests[0]*/
+		/*);*/
+		/*MPI_Iscatter(*/
+				/*input_complex, 1, matSegType,*/
+				/*tempComplex, 1, matSegType,*/
+				/*0, commHandle, &requests[1]*/
+		/*);*/
+		/*MPI_Waitall(2, requests, NULL);*/
+		#pragma omp for private(i)
+		for (size_t i = 0; i < M_loc * N_loc; i++) {
+			tempSquaring[i] *= tempComplex[i];
+		}
+		/*MPI_Gather(*/
+			/*tempSquaring, 1, matSegType,*/
+			/*a_complex, 1, matSegType,*/
+			/*0, commHandle*/
+		/*);*/
+		fftw_free(tempSquaring);
+		fftw_free(tempComplex);
+		mat2 result = calloc(M * N, sizeof(*result));
+		fftw_plan plan_result = fftw_plan_dft_c2r_2d(M, N, a_complex, result, FFTW_BACKWARD | FFTW_ESTIMATE);
+		fftw_execute(plan_result);
+		fftw_destroy_plan(plan_result);
+		// TODO: ROTATE RESULT
+		#pragma omp for private(i,j) collapse(2)
+		for (size_t i = 0; i < M; i++) {
+			for (size_t j = 0; j < N; j++) {
+				V(u, i, j) = V(result, (i + (timesteps % M)) % M, (j + (timesteps % M)) % M);
+			}
+		}
+	}
+	fftw_free(a_complex);
+	fftw_free(input_complex);
+	cleanupFFTConv();
+#else
+	fprintf(stderr, "Unsupported, recompile with -DFFT_CONV_KERNEL=1 to use");
+#endif
 } //ompAdvectExtra()
