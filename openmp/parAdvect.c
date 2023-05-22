@@ -27,6 +27,10 @@
 #define for_ru(var, lower, upper) for_rt(, var, lower, upper)
 #define for_rcu(var, lower, upper) for_rt(, var, lower, (lower) + (upper))
 
+#define CHECK_ALLOC(type, var, expr) \
+	type var = (type) expr; \
+	assert(var != NULL);
+
 // ==== BEHAVIOURAL DEFINES ====
 
 #ifndef FFT_CONV_KERNEL
@@ -85,13 +89,77 @@
 
 // ==== PROGRAM ====
 
-static int M, N, P, Q; // local store of problem parameters
+#if FFT_CONV_KERNEL == 1
+static const double CFL = 0.25;
+
+// FFT Optimisation Variables
+static double _deltax;
+static double _deltay;
+static double _dt;
+
+static double Ux;
+static double Uy;
+
+// N2 Coefficients
+static double cim1;
+static double ci0;
+static double cip1;
+static double cjm1;
+static double cj0;
+static double cjp1;
+
+static double* laxWendroffKernel;
+
+#define initFFTConv() ({ \
+	_deltax = 1.0 / N; \
+	_deltay = 1.0 / M; \
+	_dt = CFL * (_deltax < _deltay ? _deltax : _deltay); \
+	Ux = Velx * _dt / _deltax; \
+	Uy = Vely * _dt / _deltay; \
+	cim1 = (Ux / 2.0) * (Ux + 1.0); \
+	ci0 = 1.0 - (Ux * Ux); \
+	cip1 = (Ux / 2.0) * (Ux - 1.0); \
+	cjm1 = (Uy / 2.0) * (Uy + 1.0); \
+	cj0 = 1.0 - (Uy * Uy); \
+	cjp1 = (Uy / 2.0) * (Uy - 1.0); \
+	laxWendroffKernel = (double*) calloc(N * M, sizeof(*laxWendroffKernel)); \
+	assert(laxWendroffKernel != NULL); \
+	memset(laxWendroffKernel, 0, N * N * sizeof(*laxWendroffKernel)); \
+	laxWendroffKernel[0] = cim1 * cjm1; \
+	laxWendroffKernel[1] = cim1 * cj0; \
+	laxWendroffKernel[2] = cim1 * cjp1; \
+	laxWendroffKernel[M + 0] = ci0 * cjm1; \
+	laxWendroffKernel[M + 1] = ci0 * cj0; \
+	laxWendroffKernel[M + 2] = ci0 * cjp1; \
+	laxWendroffKernel[(2 * M) + 0] = cip1 * cjm1; \
+	laxWendroffKernel[(2 * M) + 1] = cip1 * cj0; \
+	laxWendroffKernel[(2 * M) + 2] = cip1 * cjp1; \
+	if (!fftw_init_threads()) { \
+		fprintf(stderr, "FFTW failed to initialise with OpenMP threads"); \
+		exit(1); \
+		return; \
+	} \
+	fftw_plan_with_nthreads(omp_get_max_threads()); \
+})
+
+#define cleanupFFTConv() ({ \
+	free(laxWendroffKernel); \
+	fftw_cleanup_threads(); \
+})
+#else
+#define initFFTConv() ({})
+#define cleanupFFTConv() ({})
+#endif
+
+static int M, N, P, Q, fieldSize; // local store of problem parameters
 static int verbosity;
 
 //sets up parameters above
 void initParParams(int M_, int N_, int P_, int Q_, int verb) {
 	M = M_, N = N_; P = P_, Q = Q_;
+	fieldSize = M * N;
 	verbosity = verb;
+	initFFTConv();
 } //initParParams()
 
 STATIC_INLINE void omp1dUpdateBoundary(mat2 u, int ldu) {
@@ -147,71 +215,10 @@ void omp1dAdvect(int reps, mat2 u, int ldu) {
 	free(v);
 } //omp1dAdvect()
 
-/**
- * This avoids the use of if statements which cause warp/wavefront divergence.
- * The reason is that, since we are using SIMD parallelism, then when we have a condition that
- * only some threads meet, the warp/wavefront is split into two execution units using bit masks
- * for each thread that either satisfies or doesn't satisfy the condition. This is called
- * wrap/wavefront divergence. These split warps/wavefronts are executed sequentially, being treated
- * as if two different instructions are being processed.
- *
- * ==== Example with if statements ==== 
- *
- * CODE:
- * 1. int threadIdx = get_global_id(0); // Get current thread in 1D block of n threads
- * 2. int threadSpecificValue;
- * 3. if (threadIdx % 2 == 0) {
- * 4.     threadSpecificValue = func(12);
- * 5. } else {
- * 6.     threadSpecificValue = func(5);
- * 7. }
- * 8. char value = someOtherOp(threadSpecificValue);
- * 
- * Kernel:
- *  - Global work size (block): 1
- *  - Local work size (item): 10
- * 
- * +------+------------------+
- * | Time | Warp Thread Mask | <-- 0: Not active (NOP), 1: Active (INSN)
- * +------+------------------+
- * | 0    | 1111111111       | <-- [Line: 1] First line executes on all threads
- * | ======= DIVERGE ======= | <-- [Line: 3] We reach the condition that is specific to only some threads
- * | 1    | 0101010101       | <-- [Line: 4] The scheduler has prioritised a particular thread mask first, only the even threads will execute
- * | 2    | 1010101010       | <-- [Line: 6] Now the odd threads will execute (once previous insn has finished, causing NOPs)
- * | ====== CONVERGE ======= | <-- [Line: 7] Warp has converged again, next instruction is not thread id specific
- * | 3    | 1111111111       | <-- [Line: 8] Execution has return to normal, we no longer have thread specific execution
- * +------+------------------+
- * 
- * This is bad for parallelism as some of the threads in the warp/wavefront are just NOPs,
- * while others are executing. We can remove this issue altogether by using arithmetic operations
- * for conditions instead of actual comparisons.
- *
- * ==== Example with arithmetic operations ====
- *
- * CODE:
- * 1. int threadIdx = get_global_id(0); // Get current thread in 1D block of n threads
- * 2. int modi = threadIdx % 2;
- * 3. int threadSpecificValue = func((modi * 5) + ((1 - modi) * 12)); // Using the property of multiplying by zero on alternating threads to choose between values
- * 4. char value = someOtherOp(threadSpecificValue);
- * 
- * Kernel:
- *  - Global work size (block): 1
- *  - Local work size (item): 10
- * 
- * +------+------------------+
- * | Time | Warp Thread Mask | <-- 0: Not active (NOP), 1: Active (INSN)
- * +------+------------------+
- * | 0    | 1111111111       | <-- [Line: 1] First line executes on all threads
- * | 1    | 1111111111       | <-- [Line: 3] Our previously, thread specific line execution is now just an arithmetic operation not specific to threads
- * | 2    | 1111111111       | <-- [Line: 8] Execution has return to normal, we no longer have thread specific execution
- * +------+------------------+
- *
- * Using this simple trick, we have successfully returned out code back to being fully parallel
- * and ensured that it also takes less overall time to execute.
- */
 #define modAlt(modi, trueValue, falseValue) (((modi) * (trueValue)) + ((1 - (modi)) * (falseValue)))
 
 #define EXCHANGE_PARAMS size_t threadId, size_t i, size_t j, mat2 u, size_t ldu, size_t N_loc, size_t M_loc, size_t M0, size_t N0
+typedef void(*ExchangeHandler)(EXCHANGE_PARAMS);
 
 void exchangeBlockCorner(EXCHANGE_PARAMS) {
 	// Exchange single corner
@@ -298,13 +305,6 @@ void exchangeBlockLeftRight(EXCHANGE_PARAMS) {
 
 void exchangeNoop(EXCHANGE_PARAMS) {}
 
-typedef void(*ExchangeHandler)(EXCHANGE_PARAMS);
-
-#define handlerAlt(modi, exchangeHandler) ((ExchangeHandler) modAlt((modi), (uintptr_t) &(exchangeHandler), (uintptr_t) &exchangeNoop))
-#define cornerMod(i, j)    (uintptr_t) ((i) % (P - 1) == 0 && (j) % (Q - 1) == 0)
-#define topBottomMod(i, j) (uintptr_t) ((i) % (P - 1) != 0 && (j) % (Q - 1) == 0)
-#define leftRightMod(i, j) (uintptr_t) ((i) % (P - 1) == 0 && (j) % (Q - 1) != 0)
-
 // ... using 2D parallelization
 void omp2dAdvect(int reps, mat2 u, int ldu) {
 	size_t i, j, r, ldv = N+2;
@@ -322,13 +322,15 @@ void omp2dAdvect(int reps, mat2 u, int ldu) {
 				size_t Q0 = threadId % Q;
 				size_t N0 = ((N / Q) * Q0) + 1;
 				size_t N_loc = (Q0 < Q - 1) ? (N / Q) : (N - N0);
-				// Pointer arithmetic to avoid conditionals and warp divergence
-				ExchangeHandler corner = handlerAlt(cornerMod(i, j), exchangeBlockCorner);
-				corner(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
-				ExchangeHandler topBottom = handlerAlt(topBottomMod(i, j), exchangeBlockTopBottom);
-				topBottom(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
-				ExchangeHandler leftRight = handlerAlt(leftRightMod(i, j), exchangeBlockLeftRight);
-				leftRight(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
+				if ((i) % (P - 1) == 0 && (j) % (Q - 1) == 0) {
+					exchangeBlockCorner(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
+				}
+				if ((i) % (P - 1) != 0 && (j) % (Q - 1) == 0) {
+					exchangeBlockTopBottom(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
+				}
+				if ((i) % (P - 1) == 0 && (j) % (Q - 1) != 0) {
+					exchangeBlockLeftRight(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
+				}
 				COMPILE_COND_T(EXCHANGE,
 					printf(
 						"[%zu] i = %zu, j = %zu, corner: %p, topBottom: %p, leftRight: %p\n",
@@ -354,132 +356,82 @@ void omp2dAdvect(int reps, mat2 u, int ldu) {
 } //omp2dAdvect()
 
 #if FFT_CONV_KERNEL == 1
-void fft_forward(mat2_r v, fftw_complex* restrict output_buffer, int n) {
-
-}
-
-void fft_backward(fftw_complex* restrict input_buffer, mat2_r output, int n) {
-
-}
-
-void convolution_fftw_2d(mat2_r real, mat2_r input, mat2_r result) {
-	int n_formula;
-	fftw_complex* a_complex;
-	fftw_complex* input_complex;
-	fftw_complex* odd_mults;
-	fft_forward(real,a_complex,n_formula);
-	bool is_initialised = false;
-	int t;
-	size_t i;
-	while (t > 1) {
-		if (t & 1) {
-			if (!is_initialised) {
-				memcpy(odd_mults, a_complex, n_formula * n_formula);
-				is_initialised = true;
-			} else {
-				#pragma omp for private(i)
-				for (i = 0; i < n_formula * n_formula; i++) {
-					odd_mults[i] = odd_mults[i] * a_complex[i];
+void repeatedSquaring(int timesteps, fftw_complex* a_complex, size_t n) {
+	bool initialised = false;
+	int t = timesteps;
+	CHECK_ALLOC(fftw_complex*, odd_mults, fftw_alloc_complex(n));
+	#pragma omp parallel
+	{
+		while (t > 1) {
+			if (t & 1) {
+				if (!initialised) {
+					memcpy(odd_mults, a_complex, n);
+					initialised = true;
+				} else {
+					#pragma omp for private(i)
+					for_r (i, 0, n) {
+						odd_mults[i] *= a_complex[i];
+					}
 				}
 			}
+			#pragma omp for private(i)
+			for_r (i, 0, n) {
+				a_complex[i] *= a_complex[i];
+			}
+			t /= 2;
 		}
-		#pragma omp for private(i)
-		for (i = 0; i < n_formula * n_formula; i++) {
-			a_complex[i] = a_complex[i] * a_complex[i];
-		}
-		t /= 2;
-	}
-	if (is_initialised) {
-		#pragma omp for private(i)
-		for (i  = 0; i < n_formula * n_formula; i++) {
-			a_complex[i] = a_complex[i] * odd_mults[i];
+		if (initialised) {
+			#pragma omp for private(i)
+			for_r (i, 0, n) {
+				a_complex[i] *= odd_mults[i];
+			}
 		}
 	}
-
-	fft_forward(input, input_complex, N);
-
-	#pragma omp for private(i)
-	for (i = 0; i < N * N; i++) {
-		a_complex[i] = input_complex[i] * a_complex[i];
-	}
-
-	fft_backward(a_complex, result, N);
+	fftw_free(odd_mults);
 }
-
 #endif
 
 // ... extra optimization variant
 void ompAdvectExtra(int r, mat2 u, int ldu) {
 #if FFT_CONV_KERNEL == 1
-	int timesteps = r;
-	fftw_complex* a_complex = (fftw_complex*) fftw_alloc_complex(M * N);
+	size_t timesteps = r;
 
-	assert(a_complex != NULL);
-	memset(a_complex, 0, sizeof(fftw_complex) * M * N);
+	// FFT Forward
+	CHECK_ALLOC(fftw_complex*, a_complex, fftw_alloc_complex(fieldSize));
+	memset(a_complex, 0, sizeof(fftw_complex) * fieldSize);
 	fftw_plan plan_u_f = fftw_plan_dft_r2c_2d(M, N, u, a_complex, FFTW_ESTIMATE);
 	fftw_execute(plan_u_f);
 	fftw_destroy_plan(plan_u_f);
+	
+	// Repeated squaring
+	repeatedSquaring(timesteps, a_complex, fieldSize);
 
-	fftw_complex* tempSquaring = (fftw_complex*) fftw_alloc_complex(M_loc * N_loc);
-	memset(tempSquaring, 0, M_loc * N_loc * sizeof(*tempSquaring));
-	/*MPI_Scatter(*/
-			/*a_complex, 1, matSegType,*/
-			/*tempSquaring, 1, matSegType,*/
-			/*0, commHandle*/
-	/*);*/
-	#pragma omp parallel
-	{
-		repeatedSquaring(timesteps, tempSquaring, M_loc * N_loc);
-		/*MPI_Gather(*/
-			/*tempSquaring, 1, matSegType,*/
-			/*a_complex, 1, matSegType,*/
-			/*0, commHandle*/
-		/*);*/
-		fftw_free(tempSquaring);
+	// FFT Forward
+	CHECK_ALLOC(fftw_complex*, input_complex, fftw_alloc_complex(fieldSize));
+	fftw_plan plan_lwk_f = fftw_plan_dft_r2c_2d(M, N, laxWendroffKernel, input_complex, FFTW_ESTIMATE);
+	fftw_execute(plan_lwk_f);
+	fftw_destroy_plan(plan_lwk_f);
 
-		fftw_complex* input_complex = (fftw_complex*) fftw_alloc_complex(M * N);
-		fftw_plan plan_lwk_f = fftw_plan_dft_r2c_2d(M, N, laxWendroffKernel, input_complex, FFTW_ESTIMATE);
-		fftw_execute(plan_lwk_f);
-		fftw_destroy_plan(plan_lwk_f);
+	// Combine kernel & rep-squared evolution
+	#pragma omp parallel for private(i) shared(a_complex, input_complex)
+	for_r (i, 0, fieldSize) {
+		a_complex[i] *= input_complex[i];
+	}
 
-		tempSquaring = (fftw_complex*) fftw_alloc_complex(M_loc * N_loc);
-		fftw_complex* tempComplex = (fftw_complex*) fftw_alloc_complex(M_loc * N_loc);
-		memset(tempSquaring, 0, M_loc * N_loc * sizeof(*tempSquaring));
-		memset(tempComplex, 0, M_loc * N_loc * sizeof(*tempComplex));
-		/*MPI_Iscatter(*/
-				/*a_complex, 1, matSegType,*/
-				/*tempSquaring, 1, matSegType,*/
-				/*0, commHandle, &requests[0]*/
-		/*);*/
-		/*MPI_Iscatter(*/
-				/*input_complex, 1, matSegType,*/
-				/*tempComplex, 1, matSegType,*/
-				/*0, commHandle, &requests[1]*/
-		/*);*/
-		/*MPI_Waitall(2, requests, NULL);*/
-		#pragma omp for private(i)
-		for (size_t i = 0; i < M_loc * N_loc; i++) {
-			tempSquaring[i] *= tempComplex[i];
-		}
-		/*MPI_Gather(*/
-			/*tempSquaring, 1, matSegType,*/
-			/*a_complex, 1, matSegType,*/
-			/*0, commHandle*/
-		/*);*/
-		fftw_free(tempSquaring);
-		fftw_free(tempComplex);
-		mat2 result = calloc(M * N, sizeof(*result));
-		fftw_plan plan_result = fftw_plan_dft_c2r_2d(M, N, a_complex, result, FFTW_BACKWARD | FFTW_ESTIMATE);
-		fftw_execute(plan_result);
-		fftw_destroy_plan(plan_result);
-		// TODO: ROTATE RESULT
-		#pragma omp for private(i,j) collapse(2)
-		for (size_t i = 0; i < M; i++) {
-			for (size_t j = 0; j < N; j++) {
-				V(u, i, j) = V(result, (i + (timesteps % M)) % M, (j + (timesteps % M)) % M);
-			}
+	// FFT Backward
+	CHECK_ALLOC(mat2, result, calloc(fieldSize, sizeof(*result)));
+	fftw_plan plan_result = fftw_plan_dft_c2r_2d(M, N, a_complex, result, FFTW_BACKWARD | FFTW_ESTIMATE);
+	fftw_execute(plan_result);
+	fftw_destroy_plan(plan_result);
+
+	// Rotate result
+	#pragma omp parallel for private(i,j) shared(u, result, timesteps, M, N) collapse(2)
+	for_r (i, 0, M) {
+		for_r (j, 0, N) {
+			V(u, i, j) = result[((i + (timesteps % M)) % M) + (((j + (timesteps % N)) % N) * M)];
 		}
 	}
+
 	fftw_free(a_complex);
 	fftw_free(input_complex);
 	cleanupFFTConv();
