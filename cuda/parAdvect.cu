@@ -63,6 +63,7 @@
 #define COMPILE_COND_F(FUNC, ...) _COMPILE_COND(FUNC##_F, __VA_ARGS__)
 
 static int M, N, Gx, Gy, Bx, By; // local store of problem parameters
+static double Ux, Uy;
 static int verbosity;
 static int boundaryGx;
 static int boundaryGy;
@@ -123,8 +124,9 @@ void initParParams(int M_, int N_, int Gx_, int Gy_, int Bx_, int By_, int verb)
 	M = M_, N = N_; Gx = Gx_; Gy = Gy_;  Bx = Bx_; By = By_; 
 	verbosity = verb;
 	calcBoundaryParams();
+	Ux = Velx * dt / deltax;
+	Uy = Vely * dt / deltay;
 } //initParParams()
-
 
 __host__ __device__ static void N2Coeff(double v, double *cm1, double *c0, double *cp1) {
 	double v2 = v/2.0;
@@ -132,6 +134,45 @@ __host__ __device__ static void N2Coeff(double v, double *cm1, double *c0, doubl
 	*c0  = 1.0 - v*v;
 	*cp1 = v2*(v-1.0);
 }
+
+__global__ void updateBoundaryNS(int N, int M, double *u, int ldu) {
+  for (int j=1; j < N+1; j++) { //top and bottom halo
+    V(u, 0, j)   = V(u, M, j);
+    V(u, M+1, j) = V(u, 1, j);
+  }
+}
+
+__global__ void updateBoundaryEW(int M, int N, double *u, int ldu) {
+  for (int i=0; i < M+2; i++) { //left and right sides of halo
+    V(u, i, 0) = V(u, i, N);
+    V(u, i, N+1) = V(u, i, 1);
+  }
+}
+
+__global__ void updateAdvectFieldK(int M, int N, double *u, int ldu, double *v, int ldv,
+			double Ux, double Uy) {
+  updateAdvectField(M, N, u, ldu, v, ldv, Ux, Uy);
+}
+
+__global__ void copyFieldK(int M, int N, double *u, int ldu, double *v, int ldv) {
+  copyField(M, N, u, ldu, v, ldv);
+}
+
+// TODO: Conver this to use threads via Gx,Gy and Bx,By
+// evolve advection over reps timesteps, with (u,ldu) containing the field
+// parallel (2D decomposition) variant
+void cuda2DAdvect(int reps, double *u, int ldu) {
+	double Ux = Velx * dt / deltax, Uy = Vely * dt / deltay;
+	int ldv = N+2; double *v;
+	HANDLE_ERROR(cudaMalloc(&v, ldv*(M+2)*sizeof(double)));
+	for (int r = 0; r < reps; r++) {
+		updateBoundaryNS<<<1,1>>>(N, M, u, ldu);
+		updateBoundaryEW<<<1,1>>>(M, N, u, ldu);
+		updateAdvectFieldK<<<1,1>>>(M, N, &V(u,1,1), ldu, &V(v,1,1), ldv, Ux, Uy);
+		copyFieldK<<<1,1>>>(M, N, &V(v,1,1), ldv, &V(u,1,1), ldu);
+	} //for(r...)
+	HANDLE_ERROR(cudaFree(v));
+} //cuda2DAdvect()
 
 /**
  * This avoids the use of if statements which cause warp/wavefront divergence.
@@ -197,26 +238,8 @@ __host__ __device__ static void N2Coeff(double v, double *cm1, double *c0, doubl
  */
 #define modAlt(modi, trueValue, falseValue) (((modi) * (trueValue)) + ((1 - (modi)) * (falseValue)))
 
-#define EXCHANGE_PARAMS size_t threadId, size_t i, size_t j, mat2 u, size_t ldu, size_t N_loc, size_t M_loc, size_t M0, size_t N0
-
-__device__ void exchangeBlockCorner(EXCHANGE_PARAMS) {
-	// Exchange single corner
-	size_t horizontalCond = i == 0;
-	size_t verticalCond = j == 0;
-	V(u, modAlt(verticalCond, 0, M + 1), modAlt(horizontalCond, 0, N + 1)) = V(u, modAlt(verticalCond, M, 1), modAlt(horizontalCond, N, 1));
-	// Exchange top or bottom
-	size_t yDst = modAlt(verticalCond, 0, M + 1);
-	size_t ySrc = modAlt(verticalCond, M, 1);
-	for_rc (x, N0, N_loc) {
-		V(u, yDst, x) = V(u, ySrc, x);
-	}
-	// Exchange left or right
-	size_t xDst = modAlt(horizontalCond, 0, N + 1);
-	size_t xSrc = modAlt(horizontalCond, N, 1);
-	for_rc (y, M0, M_loc) {
-		V(u, y, xDst) = V(u, y, xSrc);
-	}
-}
+#define EXCHANGE_PARAMS size_t i, size_t j, mat2 u, size_t ldu, size_t N_loc, size_t M_loc, size_t M0, size_t N0
+typedef void (*ExchangeHandler)(EXCHANGE_PARAMS);
 
 __device__ void exchangeBlockTopBottom(EXCHANGE_PARAMS) {
 	// Exchange top or bottom
@@ -238,37 +261,87 @@ __device__ void exchangeBlockLeftRight(EXCHANGE_PARAMS) {
 	}
 }
 
+__device__ void exchangeBlockCorner(EXCHANGE_PARAMS) {
+	// Exchange single corner
+	size_t horizontalCond = i == 0;
+	size_t verticalCond = j == 0;
+	V(u, modAlt(verticalCond, 0, M + 1), modAlt(horizontalCond, 0, N + 1)) = V(u, modAlt(verticalCond, M, 1), modAlt(horizontalCond, N, 1));
+	// Exchange top or bottom
+	exchangeBlockTopBottom(i, j, u, ldu, N_loc, M_loc, M0, N0);
+	// Exchange left or right
+	exchangeBlockLeftRight(i, j, u, ldu, N_loc, M_loc, M0, N0);
+}
+
 __device__ void exchangeNoop(EXCHANGE_PARAMS) {}
 
-typedef void(*ExchangeHandler)(EXCHANGE_PARAMS);
-
-#define handlerAlt(modi, exchangeHandler) ((ExchangeHandler) modAlt((modi), (uintptr_t) &(exchangeHandler), (uintptr_t) &exchangeNoop))
+#define exchangeHandlerAlt(modi, exchangeHandler) ((ExchangeHandler) modAlt((modi), (uintptr_t) &(exchangeHandler), (uintptr_t) &exchangeNoop))
 #define cornerMod(i, j)    (uintptr_t) ((i) % (P - 1) == 0 && (j) % (Q - 1) == 0)
 #define topBottomMod(i, j) (uintptr_t) ((i) % (P - 1) != 0 && (j) % (Q - 1) == 0)
 #define leftRightMod(i, j) (uintptr_t) ((i) % (P - 1) == 0 && (j) % (Q - 1) != 0)
 
-#define THREAD_LOCALS_LAYOUT \
+#define UPDATE_PARAMS size_t i, size_t j, mat2 u, size_t ldu, mat2 v, size_t ldv, size_t N_loc, size_t M_loc, size_t M0, size_t N0
+typedef void (*UpdateHandler)(UPDATE_PARAMS);
+
+__device__ void updateCorner(UPDATE_PARAMS) {
+	// Update single corner
+	size_t horizontalCond = i == 0;
+	size_t verticalCond = j == 0;
+	#define cornerRef(arr) &V(arr, modAlt(verticalCond, 1, M), modAlt(horizontalCond, 1, N))
+	updateAdvectField(1, 1, cornerRef(u), ldu, cornerRef(v), ldv, Ux, Uy);
+	// Update top or bottom
+	if (N_loc > 1) {
+		#define topBottomRef(arr) &V(arr, modAlt(verticalCond, M0, M), modAlt(horizontalCond, N0 + 1, N0))
+		updateAdvectField(1, N_loc - 1, topBottomRef(u), ldu, topBottomRef(v), ldv, Ux, Uy);
+		#undef topBottomRef
+	}
+	// Update left or right
+	if (M_loc > 1) {
+		#define leftRightRef(arr) &V(arr, modAlt(horizontalCond, M0 + 1, M0), modAlt(verticalCond, N0, N))
+		updateAdvectField(M_loc - 1, 1, leftRightRef(u), ldu, leftRightRef(v), ldv, Ux, Uy);
+		#undef leftRightRef
+	}
+}
+
+__device__ void updateTopBottom(UPDATE_PARAMS) {
+	size_t verticalCond = j == 0;
+	#define topBottomRef(arr) &V(arr, modAlt(verticalCond, M0, M), N0)
+	updateAdvectField(1, N_loc, topBottomRef(u), ldu, topBottomRef(v), ldv, Ux, Uy);
+}
+
+__device__ void updateLeftRight(UPDATE_PARAMS) {
+	size_t horizontalCond = i == 0;
+	#define leftRightRef(arr) &V(arr, M0, modAlt(horizontalCond, N0, N))
+	updateAdvectField(M_loc, 1, leftRightRef(u), ldu, leftRightRef(v), ldv, Ux, Uy);
+}
+
+__device__ void updateNoop(UPDATE_PARAMS) {}
+
+#define updateHandlerAlt(modi, updateHandler) ((UpdateHandler) modAlt((modi), (uintptr_t) &(updateHandler), (uintptr_t) &updateNoop))
+
+#define THREAD_LOCALS_LAYOUT(_M, _N, off) \
 	size_t x = threadIdx.x + blockIdx.x * blockDim.x; \
 	size_t y = threadIdx.y + blockIdx.y * blockDim.y; \
 	size_t offset = x + y * blockDim.x * gridDim.x; \
+	size_t P = blockDim.x * gridDim.x; \
+	size_t Q = blockDim.y * gridDim.y; \
 	size_t P0 = threadId / Q; \
-	size_t M0 = ((M / P) * P0) + 1; \
+	size_t M0 = (((_M) / P) * P0) + (off); \
 	size_t M_loc = (P0 < P - 1) ? (M / P) : (M - M0); \
 	size_t Q0 = threadId % Q; \
-	size_t N0 = ((N / Q) * Q0) + 1; \
-	size_t N_loc = (Q0 < Q - 1) ? (N / Q) : (N - N0);
+	size_t N0 = (((_N) / Q) * Q0) + (off); \
+	size_t N_loc = (Q0 < Q - 1) ? (N / Q) : (N - N0)
 
 #define KERNEL_PARAMS __shared__ mat2_r u, size_t ldu, __shared__ mat2_r v, size_t ldv
 
 __global__ void updateBoundaries(KERNEL_PARAMS) {
-	THREAD_LOCALS_LAYOUT
-	// Pointer arithmetic to avoid conditionals and warp divergence
-	ExchangeHandler corner = handlerAlt(cornerMod(i, j), exchangeBlockCorner);
-	corner(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
-	ExchangeHandler topBottom = handlerAlt(topBottomMod(i, j), exchangeBlockTopBottom);
-	topBottom(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
-	ExchangeHandler leftRight = handlerAlt(leftRightMod(i, j), exchangeBlockLeftRight);
-	leftRight(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
+	THREAD_LOCALS_LAYOUT(M, N, 1);
+	// Pointer arithmetic to avoid conditionals and warp divergence on invocations, reducing the overall diveregence time
+	ExchangeHandler exCorner = exchangeHandlerAlt(cornerMod(x, y), exchangeBlockCorner);
+	exCorner(x, y, u, ldu, N_loc, M_loc, M0, N0);
+	ExchangeHandler exTopBottom = exchangeHandlerAlt(topBottomMod(x, y), exchangeBlockTopBottom);
+	exTopBottom(x, y, u, ldu, N_loc, M_loc, M0, N0);
+	ExchangeHandler exLeftRight = exchangeHandlerAlt(leftRightMod(x, y), exchangeBlockLeftRight);
+	exLeftRight(x, y, u, ldu, N_loc, M_loc, M0, N0);
 	COMPILE_COND_T(EXCHANGE,
 		printf(
 			"[%zu] i = %zu, j = %zu, corner: %p, topBottom: %p, leftRight: %p\n",
@@ -279,28 +352,28 @@ __global__ void updateBoundaries(KERNEL_PARAMS) {
 			(void*) ((uintptr_t) (leftRight != exchangeNoop) * (uintptr_t) leftRight)
 		);
 	)
-	updateAdvectField(M_loc, N_loc, &V(u, M0, N0), ldu, &V(v, M0, N0), ldv);
-	// Update top/bottom (full) if at top or bottom
-	// Update left/right (without top or bottom, if it at corner) if at left or right
+	UpdateHandler upCorner = updateHandlerAlt(cornerMod(x, y), updateCorner);
+	upCorner(x, y, u, ldu, N_loc, M_loc, M0, N0);
+	UpdateHandler upTopBottom = updateHandlerAlt(topBottomMod(x, y), updateTopBottom);
+	upTopBottom(x, y, u, ldu, N_loc, M_loc, M0, N0);
+	UpdateHandler upLeftRight = updateHandlerAlt(leftRightMod(x, y), updateLeftRight);
+	upLeftRight(x, y, u, ldu, N_loc, M_loc, M0, N0);
 }
 
 __global__ void updateInnerAdvectFieldDevice(KERNEL_PARAMS) {
-	//THREAD_LOCALS_LAYOUT
-	size_t x = threadIdx.x + blockIdx.x * blockDim.x;
-	size_t y = threadIdx.y + blockIdx.y * blockDim.y;
+	THREAD_LOCALS_LAYOUT(M - 1, N - 1, 2);
 	size_t globalIdx = x + y * blockDim.x * gridDim.x;
 	updateAdvectField(M_loc, N_loc, &V(u, M0, N0), ldu, &V(v, M0, N0), ldv);
 }
 
-// evolve advection over reps timesteps, with (u,ldu) containing the field
-// parallel (2D decomposition) variant
-void cuda2DAdvect(int reps, double *u, int ldu) {
+// ... optimized parallel variant
+void cudaOptAdvect(int reps, double *u, int ldu) {
 	size_t ldv = N + 2;
-	mat2 v = cudaMalloc(ldv * (M + 2), sizeof(*v));
-	assert(v != NULL);
-	mat2 uDev = cudaMalloc(ldv * (M + 2), sizeof(*uDev));
-	assert(uDev != NULL);
-	cudaMemcpy(uDev, u, ldv * (M + 2) * sizeof(*u), cudaMemcpyHostToDevice);
+	mat2 v;
+	HANDLE_ERROR(cudaMalloc(&v, ldv * (M + 2), sizeof(*v)));
+	mat2 uDev;
+	HANDLE_ERROR(cudaMalloc(&uDev, ldv * (M + 2), sizeof(*uDev)));
+	HANDLE_ERROR(cudaMemcpy(uDev, u, ldv * (M + 2) * sizeof(*u), cudaMemcpyHostToDevice));
 	dim3 dimGrid(Gx, Gy);
 	dim3 dimBlock(Bx, By);
 	// Allow for concurrent exection of boundary updates alongside inner field updates.
@@ -316,14 +389,7 @@ void cuda2DAdvect(int reps, double *u, int ldu) {
 		cudaDeviceSynchronize(); // Wait for both streams to complete
 		COMPILE_COND_T(SWAP, swap(uDev, v, mat2)); // No need for copies, device pointer swaps are sufficient
 	}
-	cudaMemcpy(u, uDev, ldv * (M + 2) * sizeof(*u), cudaMemcpyDeviceToHost);
-	cudaFree(uDev);
-	cudaFree(v);
+	HANDLE_ERROR(cudaMemcpy(u, uDev, ldv * (M + 2) * sizeof(*u), cudaMemcpyDeviceToHost));
+	HANDLE_ERROR(cudaFree(uDev));
+	HANDLE_ERROR(cudaFree(v));
 } //cuda2DAdvect()
-
-
-
-// ... optimized parallel variant
-void cudaOptAdvect(int reps, double *u, int ldu, int w) {
-
-} //cudaOptAdvect()
