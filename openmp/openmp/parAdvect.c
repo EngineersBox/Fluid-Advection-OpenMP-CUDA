@@ -151,12 +151,13 @@ static double* laxWendroffKernel;
 #define cleanupFFTConv() ({})
 #endif
 
-static int M, N, P, Q; // local store of problem parameters
+static int M, N, P, Q, fieldSize; // local store of problem parameters
 static int verbosity;
 
 //sets up parameters above
 void initParParams(int M_, int N_, int P_, int Q_, int verb) {
 	M = M_, N = N_; P = P_, Q = Q_;
+	fieldSize = M * N;
 	verbosity = verb;
 	initFFTConv();
 } //initParParams()
@@ -394,7 +395,6 @@ void repeatedSquaring(int timesteps, fftw_complex* a_complex, size_t n) {
 void ompAdvectExtra(int r, mat2 u, int ldu) {
 #if FFT_CONV_KERNEL == 1
 	size_t timesteps = r;
-	size_t fieldSize = M * N;
 
 	// FFT Forward
 	CHECK_ALLOC(fftw_complex*, a_complex, fftw_alloc_complex(fieldSize));
