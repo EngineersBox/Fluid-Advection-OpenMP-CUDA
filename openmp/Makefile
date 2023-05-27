@@ -11,16 +11,15 @@ CCFLAGS=-O3 -fopenmp -Wattributes -Wall -DFFT_CONV_KERNEL=$(FFT_CONV_KERNEL)
 LINKERFLAGS=
 
 ifeq ($(FFT_CONV_KERNEL), 1)
-	LINKERFLAGS=$(shell pkg-config --libs fftw3)
-	LINKERFLAGS:=-lfftw3_omp
-	CCFLAGS:=$(shell pkg-config --cflags fftw3)
+	LINKERFLAGS=$(shell pkg-config --libs fftw3) -lfftw3_omp
+	CCFLAGS:=$(CCFLAGS) $(shell pkg-config --cflags fftw3)
 endif
 
 all: $(PROG) 
 
 %: %.o $(OBJS)
-	gcc-13 -o $* $*.o $(OBJS) $(LINKERFLAGS) -lgomp -lm
+	gcc -o $* $*.o $(OBJS) $(LINKERFLAGS) -lgomp -lm
 %.o: %.c $(HDRS)
-	gcc-13 -Wall $(CCFLAGS) -c $*.c
+	gcc -Wall $(CCFLAGS) -c $*.c
 clean:
 	rm -f *.o $(PROG)

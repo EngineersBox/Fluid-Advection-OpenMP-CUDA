@@ -96,6 +96,9 @@ raw = dict(zip(p + p2, advection_time + at_2))
 ordered_p = sorted(p + p2)
 ordered_at = [raw[i] for i in ordered_p]
 
+for _p, _at in zip(ordered_p, ordered_at):
+    print(_p, _at)
+
 # ==== 2D STUFF ====
 
 ordered_p = [
@@ -137,6 +140,9 @@ ordered_at = [
     7.99e-02
 ]
 
+# for _p, _at in zip(ordered_p, ordered_at):
+    # print(_p, _at)
+
 load_misses = [
     4.35,
     4.19,
@@ -177,49 +183,76 @@ load_misses = [
 
 # ==== GPU ====
 
-ordered_p [
+ordered_p = [
     "1x1,1x1",
     "1x1,1x32",
     "1x1,32x1",
-    "128x128,32x32",
-    "128x128,32x16",
-    "256x128,16x32",
-    "256x256,16x16",
-
-    "512x512,32x32",
-    "512x512,32x16",
-    "1024x512,16x32",
-    "1024x1024,16x16"
+    # "32x32,32x32",
+    # "64x64,64x64",
+    # "128x128,32x32",
+    # "128x128,32x16",
+    # "256x128,16x32",
+    # "256x256,16x16",
 ]
+ordered_p += ordered_p + ordered_p
 
 ordered_at = [
-    0,
-    0,
+    7.36e+02,
+    2.21e+01,
     1.52e+02,
-    6.21e-01,
-    4.25e-01,
-    5.37e-01,
-    4.97e-01,
+    # 5.25e-01,
+    # 3.26e-01,
+    # 6.21e-01,
+    # 4.25e-01,
+    # 5.37e-01,
+    # 4.97e-01,
 ]
 
-types = (["L1 D-Cache"] * len(ordered_p)) + (["LLC"] * len(ordered_p))
+# ==== GPU 2 ====
 
-data = pd.DataFrame({"Aspect Ratios": ordered_p, "Advection Time (s)": ordered_at})
-miss_data = pd.DataFrame({"Aspect Ratios": ordered_p + ordered_p, "Load Misses (%)": load_misses, "type": types})
+ordered_at += [
+    6.16e+02,
+    1.97e+01,
+    1.53e+01,
+    # 7.22e-03,
+    # 3.85e-02,
+    # 4.72e-03,
+    # 5.01e-03,
+    # 3.08e-03,
+    # 4.64e-03
+]
+
+ordered_at += [
+    6.98e+02,
+    2.18e+01,
+    5.52e+01,
+    # 3.29e-01,
+    # 4.77e-01,
+    # 1.39e-01,
+    # 3.83e-02,
+    # 2.75e-02,
+    # 5.26e-02
+]
+
+types = (["Baseline"] * 3) + (["Optimised - Swap"] * 3) + (["Optimised - Copy"] * 3)
+
+
+data = pd.DataFrame({"Aspect Ratios (GxGy,BxBy)": ordered_p, "Advection Time (s)": ordered_at, "type": types})
+#miss_data = pd.DataFrame({"Aspect Ratios": ordered_p + ordered_p, "Load Misses (%)": load_misses, "type": types})
 
 fig, ax1 = plt.subplots(figsize=(12,6))
 
 sns.set_style("darkgrid", {"grid.color": ".6", "grid.linestyle": ":"})
-sns.barplot(y = "Load Misses (%)", x = "Aspect Ratios", data = miss_data, hue = "type", ax=ax1, palette=sns.color_palette("muted"))
-ax2 = ax1.twinx()
-g = sns.lineplot(y = "Advection Time (s)", x = "index", data = data.reset_index(), marker="o", ax=ax2, color="black")
-plt.title("Varying Aspect Ratios 2D Advection OpenMP")
+#sns.barplot(y = "Load Misses (%)", x = "Aspect Ratios", data = miss_data, hue = "type", ax=ax1, palette=sns.color_palette("muted"))
+#ax2 = ax1.twinx()
+g = sns.lineplot(y = "Advection Time (s)", x = "Aspect Ratios (GxGy,BxBy)", data = data.reset_index(), marker="o", hue = "type", ax=ax1)#, color="black")
+plt.title("CUDA 2D Optimised Implementation Advection Time vs Small Aspect Ratios")
 plt.ticklabel_format(style="scientific", axis="y", scilimits=(0,0))
 # plt.xlim(0,50)
 # plt.xticks(range(0,50,4))
-ax1.legend(loc='upper right')
-plt.axvline(5.5, color="red")
-plt.axvline(10.5, color="red")
+#ax1.legend(loc='upper right')
+#plt.axvline(5.5, color="red")
+#plt.axvline(10.5, color="red")
 
 # ymin, ymax = g.get_ylim()
 # offset = (ymax - ymin) / 50

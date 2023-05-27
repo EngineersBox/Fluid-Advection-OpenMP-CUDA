@@ -8,25 +8,23 @@
 #include <math.h>
 #include "serAdvect.h" // advection parameters
 
-#include <cufftw.h>
-
 // ==== CONSTRUCT DEFINES ==== 
 
 #define STATIC_INLINE __attribute__((always_inline)) static inline
 #define mat2 double*
-#define mat2_r mat2 restrict
+#define mat2_r mat2 __restrict__
 
 #define for_rt(T, var, lower, upper) for (T var = (lower); (var) < (upper); (var)++)
 #define for_rtc(T, var, lower, upper) for_rt(T, var, lower, (lower) + (upper))
-#define for_r(var, lower, upper) for_rt(size_t, var, lower, upper)
-#define for_rc(var, lower, upper) for_rt(size_t, var, lower, (lower) + (upper))
+#define for_r(var, lower, upper) for_rt(int, var, lower, upper)
+#define for_rc(var, lower, upper) for_rt(int, var, lower, (lower) + (upper))
 #define for_ru(var, lower, upper) for_rt(, var, lower, upper)
 #define for_rcu(var, lower, upper) for_rt(, var, lower, (lower) + (upper))
 
 // ==== BEHAVIOURAL DEFINES ====
 
 #ifndef LOG_2D_EXCHANGES
-#define LOG_2D_EXCHANGES 1
+#define LOG_2D_EXCHANGES 0
 #endif
 
 #ifndef SWAP_BUFFERS
@@ -81,14 +79,14 @@ static int boundaryWorkSizeY;
 #define max(a,b) _compare(a,b,>)
 #define min(a,b) _compare(a,b,<)
 
-void calcBoundaryWorkSize(size_t totalEdgeElements) {
+void calcBoundaryWorkSize(int totalEdgeElements) {
 	boundaryWorkSizeX = max(1, N / (boundaryGx * boundaryBx));
 	boundaryWorkSizeY = max(1, M / (boundaryGy * boundaryBy));
 }
 
 void calcBoundaryParams() {
-	size_t totalEdgeElements = (M * 2) + ((N - 2) * 2);
-	size_t totalThreads = Gx * Gy * Bx * By; // Is this right?
+	int totalEdgeElements = (M * 2) + ((N - 2) * 2);
+	int totalThreads = Gx * Gy * Bx * By; // Is this right?
 	if (totalEdgeElements >= totalThreads) {
 		boundaryGx = Gx;
 		boundaryGy = Gy;
@@ -97,7 +95,7 @@ void calcBoundaryParams() {
 		calcBoundaryWorkSize(totalEdgeElements);
 		return;
 	}
-	size_t maxThreads = totalEdgeElements;
+	int maxThreads = totalEdgeElements;
 	if (maxThreads < Bx * By) {
 		boundaryGx = boundaryGy = 1;
 		boundaryBx = maxThreads % Bx;
@@ -107,7 +105,7 @@ void calcBoundaryParams() {
 	}
 	boundaryBx = Bx;
 	boundaryBy = By;
-	size_t blocks = (size_t) ceilf((float) maxThreads / (float) (Bx * By));
+	int blocks = (int) ceilf((float) maxThreads / (float) (Bx * By));
 	if (blocks < Gx * Gy) {
 		boundaryGx = blocks % Gx;
 		boundaryGy = max(blocks / Gx, Gy);
@@ -119,14 +117,33 @@ void calcBoundaryParams() {
 
 }
 
+#define _h2d(var) HANDLE_ERROR(cudaMemcpyToSymbol(&(dev_##var), &(var), sizeof(var)))
+
 //sets up parameters above
 void initParParams(int M_, int N_, int Gx_, int Gy_, int Bx_, int By_, int verb) {
 	M = M_, N = N_; Gx = Gx_; Gy = Gy_;  Bx = Bx_; By = By_; 
 	verbosity = verb;
 	calcBoundaryParams();
+	printf(
+		"Boundary params: Grid=(%d,%d) Block=(%d,%d)\n",
+		boundaryGx, boundaryGy,
+		boundaryBx, boundaryBy
+	);
 	Ux = Velx * dt / deltax;
 	Uy = Vely * dt / deltay;
 } //initParParams()
+
+#define THREAD_LOCALS_LAYOUT(_M, _N, off) \
+	int blockId = blockIdx.x + blockIdx.y * gridDim.x; \
+	int threadId = blockId * (blockDim.x * blockDim.y) + (threadIdx.y * blockDim.x) + threadIdx.x; \
+	int P = gridDim.x * blockDim.x; \
+	int Q = gridDim.y * blockDim.y; \
+	int x = threadId % Q; \
+	int M0 = (((_M) / P) * x) + (off); \
+	int M_loc = (x < P - 1) ? ((_M) / P) : ((_M) - M0); \
+	int y = threadId / Q; \
+	int N0 = (((_N) / Q) * y) + (off); \
+	int N_loc = (y < Q - 1) ? ((_N) / Q) : ((_N) - N0)
 
 __host__ __device__ static void N2Coeff(double v, double *cm1, double *c0, double *cp1) {
 	double v2 = v/2.0;
@@ -135,42 +152,56 @@ __host__ __device__ static void N2Coeff(double v, double *cm1, double *c0, doubl
 	*cp1 = v2*(v-1.0);
 }
 
-__global__ void updateBoundaryNS(int N, int M, double *u, int ldu) {
-  for (int j=1; j < N+1; j++) { //top and bottom halo
-    V(u, 0, j)   = V(u, M, j);
-    V(u, M+1, j) = V(u, 1, j);
-  }
+#define DEV_DATA int dev_N, int dev_M, int dev_Ux, int dev_Uy
+#define HOST_DATA N, M, Ux, Uy
+#define FWD_DEV_DATA dev_N, dev_M, dev_Ux, dev_Uy
+
+__global__ void updateBoundaryNSBlock(double *u, int ldu, DEV_DATA) {
+	THREAD_LOCALS_LAYOUT(dev_M, dev_N, 1);
+	for_r (j, N0, N0 + N_loc) {
+		V(u, 0, j) = V(u, dev_M, j);
+		V(u, dev_M + 1, j) = V(u, 1, j);
+	}
 }
 
-__global__ void updateBoundaryEW(int M, int N, double *u, int ldu) {
-  for (int i=0; i < M+2; i++) { //left and right sides of halo
-    V(u, i, 0) = V(u, i, N);
-    V(u, i, N+1) = V(u, i, 1);
-  }
+__global__ void updateBoundaryEWBlock(double *u, int ldu, DEV_DATA) {
+	THREAD_LOCALS_LAYOUT(dev_M + 2, dev_N, 0);
+	for_r (i, M0, M0 + M_loc) {
+		V(u, i, 0) = V(u, i, dev_N);
+		V(u, i, dev_N + 1) = V(u, i, 1);
+	}
 }
 
-__global__ void updateAdvectFieldK(int M, int N, double *u, int ldu, double *v, int ldv,
-			double Ux, double Uy) {
-  updateAdvectField(M, N, u, ldu, v, ldv, Ux, Uy);
+__global__ void updateAdvectFieldBlock(double *u, int ldu, double *v, int ldv, DEV_DATA) {
+	THREAD_LOCALS_LAYOUT(dev_M, dev_N, 1);
+	updateAdvectField(M_loc, N_loc, &V(u, M0, N0), ldu, &V(v, M0, N0), ldv, dev_Ux, dev_Uy);
 }
 
-__global__ void copyFieldK(int M, int N, double *u, int ldu, double *v, int ldv) {
-  copyField(M, N, u, ldu, v, ldv);
+__global__ void copyFieldBlock(double *u, int ldu, double *v, int ldv, DEV_DATA) {
+	THREAD_LOCALS_LAYOUT(dev_M, dev_N, 1);
+	copyField(M_loc, N_loc, &V(u, M0, N0), ldu, &V(v, M0, N0), ldv);
 }
 
-// TODO: Conver this to use threads via Gx,Gy and Bx,By
 // evolve advection over reps timesteps, with (u,ldu) containing the field
 // parallel (2D decomposition) variant
 void cuda2DAdvect(int reps, double *u, int ldu) {
 	double Ux = Velx * dt / deltax, Uy = Vely * dt / deltay;
 	int ldv = N+2; double *v;
 	HANDLE_ERROR(cudaMalloc(&v, ldv*(M+2)*sizeof(double)));
+	mat2 dev_u;
+	HANDLE_ERROR(cudaMalloc(&dev_u, ldv * (M + 2) * sizeof(double)));
+	HANDLE_ERROR(cudaMemcpy(dev_u, u, ldv * (M + 2) * sizeof(double), cudaMemcpyHostToDevice));
+	cudaDeviceSynchronize();
+
+	dim3 dimBlock(Bx,By);
+	dim3 dimGrid(Gx,Gy);
 	for (int r = 0; r < reps; r++) {
-		updateBoundaryNS<<<1,1>>>(N, M, u, ldu);
-		updateBoundaryEW<<<1,1>>>(M, N, u, ldu);
-		updateAdvectFieldK<<<1,1>>>(M, N, &V(u,1,1), ldu, &V(v,1,1), ldv, Ux, Uy);
-		copyFieldK<<<1,1>>>(M, N, &V(v,1,1), ldv, &V(u,1,1), ldu);
+		updateBoundaryNSBlock<<<(Gx,1),(Bx,1)>>>(dev_u, ldu, HOST_DATA);
+		updateBoundaryEWBlock<<<(1,Gy),(1,By)>>>(dev_u, ldu, HOST_DATA);
+		updateAdvectFieldBlock<<<dimGrid,dimBlock>>>(dev_u, ldu, v, ldv, HOST_DATA);
+		copyFieldBlock<<<dimGrid,dimBlock>>>(v, ldv, dev_u, ldu, HOST_DATA);
 	} //for(r...)
+	HANDLE_ERROR(cudaFree(dev_u));
 	HANDLE_ERROR(cudaFree(v));
 } //cuda2DAdvect()
 
@@ -238,14 +269,14 @@ void cuda2DAdvect(int reps, double *u, int ldu) {
  */
 #define modAlt(modi, trueValue, falseValue) (((modi) * (trueValue)) + ((1 - (modi)) * (falseValue)))
 
-#define EXCHANGE_PARAMS size_t i, size_t j, mat2 u, size_t ldu, size_t N_loc, size_t M_loc, size_t M0, size_t N0
+#define EXCHANGE_PARAMS int i, int j, mat2 u, int ldu, int N_loc, int M_loc, int M0, int N0, DEV_DATA
 typedef void (*ExchangeHandler)(EXCHANGE_PARAMS);
 
 __device__ void exchangeBlockTopBottom(EXCHANGE_PARAMS) {
 	// Exchange top or bottom
-	size_t verticalCond = j == 0;
-	size_t yDst = modAlt(verticalCond, 0, M + 1);
-	size_t ySrc = modAlt(verticalCond, M, 1);
+	int verticalCond = i == 0;
+	int yDst = modAlt(verticalCond, 0, dev_M + 1);
+	int ySrc = modAlt(verticalCond, dev_M, 1);
 	for_rc (x, N0, N_loc) {
 		V(u, yDst, x) = V(u, ySrc, x);
 	}
@@ -253,9 +284,9 @@ __device__ void exchangeBlockTopBottom(EXCHANGE_PARAMS) {
 
 __device__ void exchangeBlockLeftRight(EXCHANGE_PARAMS) {
 	// Exchange left or right
-	size_t horizontalCond = i == 0;
-	size_t xDst = modAlt(horizontalCond, 0, N + 1);
-	size_t xSrc = modAlt(horizontalCond, N, 1);
+	int horizontalCond = j == 0;
+	int xDst = modAlt(horizontalCond, 0, dev_N + 1);
+	int xSrc = modAlt(horizontalCond, dev_N, 1);
 	for_rc (y, M0, M_loc) {
 		V(u, y, xDst) = V(u, y, xSrc);
 	}
@@ -263,13 +294,13 @@ __device__ void exchangeBlockLeftRight(EXCHANGE_PARAMS) {
 
 __device__ void exchangeBlockCorner(EXCHANGE_PARAMS) {
 	// Exchange single corner
-	size_t horizontalCond = i == 0;
-	size_t verticalCond = j == 0;
-	V(u, modAlt(verticalCond, 0, M + 1), modAlt(horizontalCond, 0, N + 1)) = V(u, modAlt(verticalCond, M, 1), modAlt(horizontalCond, N, 1));
+	int horizontalCond = j == 0;
+	int verticalCond = i == 0;
+	V(u, modAlt(verticalCond, 0, dev_M + 1), modAlt(horizontalCond, 0, dev_N + 1)) = V(u, modAlt(verticalCond, dev_M, 1), modAlt(horizontalCond, dev_N, 1));
 	// Exchange top or bottom
-	exchangeBlockTopBottom(i, j, u, ldu, N_loc, M_loc, M0, N0);
+	exchangeBlockTopBottom(i, j, u, ldu, N_loc, M_loc, M0, N0, FWD_DEV_DATA);
 	// Exchange left or right
-	exchangeBlockLeftRight(i, j, u, ldu, N_loc, M_loc, M0, N0);
+	exchangeBlockLeftRight(i, j, u, ldu, N_loc, M_loc, M0, N0, FWD_DEV_DATA);
 }
 
 __device__ void exchangeNoop(EXCHANGE_PARAMS) {}
@@ -279,100 +310,131 @@ __device__ void exchangeNoop(EXCHANGE_PARAMS) {}
 #define topBottomMod(i, j) (uintptr_t) ((i) % (P - 1) != 0 && (j) % (Q - 1) == 0)
 #define leftRightMod(i, j) (uintptr_t) ((i) % (P - 1) == 0 && (j) % (Q - 1) != 0)
 
-#define UPDATE_PARAMS size_t i, size_t j, mat2 u, size_t ldu, mat2 v, size_t ldv, size_t N_loc, size_t M_loc, size_t M0, size_t N0
+#define UPDATE_PARAMS int i, int j, mat2 u, int ldu, mat2 v, int ldv, int N_loc, int M_loc, int M0, int N0, DEV_DATA
 typedef void (*UpdateHandler)(UPDATE_PARAMS);
 
 __device__ void updateCorner(UPDATE_PARAMS) {
 	// Update single corner
-	size_t horizontalCond = i == 0;
-	size_t verticalCond = j == 0;
-	#define cornerRef(arr) &V(arr, modAlt(verticalCond, 1, M), modAlt(horizontalCond, 1, N))
-	updateAdvectField(1, 1, cornerRef(u), ldu, cornerRef(v), ldv, Ux, Uy);
+	int horizontalCond = i == 0;
+	int verticalCond = j == 0;
+	#define cornerRef(arr) &V(arr, modAlt(verticalCond, 1, dev_M), modAlt(horizontalCond, 1, dev_N))
+	updateAdvectField(1, 1, cornerRef(u), ldu, cornerRef(v), ldv, dev_Ux, dev_Uy);
 	// Update top or bottom
 	if (N_loc > 1) {
-		#define topBottomRef(arr) &V(arr, modAlt(verticalCond, M0, M), modAlt(horizontalCond, N0 + 1, N0))
-		updateAdvectField(1, N_loc - 1, topBottomRef(u), ldu, topBottomRef(v), ldv, Ux, Uy);
+		#define topBottomRef(arr) &V(arr, modAlt(verticalCond, M0, dev_M), modAlt(horizontalCond, N0 + 1, N0))
+		updateAdvectField(1, N_loc - 1, topBottomRef(u), ldu, topBottomRef(v), ldv, dev_Ux, dev_Uy);
 		#undef topBottomRef
 	}
 	// Update left or right
 	if (M_loc > 1) {
-		#define leftRightRef(arr) &V(arr, modAlt(horizontalCond, M0 + 1, M0), modAlt(verticalCond, N0, N))
-		updateAdvectField(M_loc - 1, 1, leftRightRef(u), ldu, leftRightRef(v), ldv, Ux, Uy);
+		#define leftRightRef(arr) &V(arr, modAlt(horizontalCond, M0 + 1, M0), modAlt(verticalCond, N0, dev_N))
+		updateAdvectField(M_loc - 1, 1, leftRightRef(u), ldu, leftRightRef(v), ldv, dev_Ux, dev_Uy);
 		#undef leftRightRef
 	}
 }
 
 __device__ void updateTopBottom(UPDATE_PARAMS) {
-	size_t verticalCond = j == 0;
-	#define topBottomRef(arr) &V(arr, modAlt(verticalCond, M0, M), N0)
-	updateAdvectField(1, N_loc, topBottomRef(u), ldu, topBottomRef(v), ldv, Ux, Uy);
+	int verticalCond = j == 0;
+	#define topBottomRef(arr) &V(arr, modAlt(verticalCond, M0, dev_M), N0)
+	updateAdvectField(1, N_loc, topBottomRef(u), ldu, topBottomRef(v), ldv, dev_Ux, dev_Uy);
 }
 
 __device__ void updateLeftRight(UPDATE_PARAMS) {
-	size_t horizontalCond = i == 0;
-	#define leftRightRef(arr) &V(arr, M0, modAlt(horizontalCond, N0, N))
-	updateAdvectField(M_loc, 1, leftRightRef(u), ldu, leftRightRef(v), ldv, Ux, Uy);
+	int horizontalCond = i == 0;
+	#define leftRightRef(arr) &V(arr, M0, modAlt(horizontalCond, N0, dev_N))
+	updateAdvectField(M_loc, 1, leftRightRef(u), ldu, leftRightRef(v), ldv, dev_Ux, dev_Uy);
 }
 
 __device__ void updateNoop(UPDATE_PARAMS) {}
 
 #define updateHandlerAlt(modi, updateHandler) ((UpdateHandler) modAlt((modi), (uintptr_t) &(updateHandler), (uintptr_t) &updateNoop))
 
-#define THREAD_LOCALS_LAYOUT(_M, _N, off) \
-	size_t x = threadIdx.x + blockIdx.x * blockDim.x; \
-	size_t y = threadIdx.y + blockIdx.y * blockDim.y; \
-	size_t offset = x + y * blockDim.x * gridDim.x; \
-	size_t P = blockDim.x * gridDim.x; \
-	size_t Q = blockDim.y * gridDim.y; \
-	size_t P0 = threadId / Q; \
-	size_t M0 = (((_M) / P) * P0) + (off); \
-	size_t M_loc = (P0 < P - 1) ? (M / P) : (M - M0); \
-	size_t Q0 = threadId % Q; \
-	size_t N0 = (((_N) / Q) * Q0) + (off); \
-	size_t N_loc = (Q0 < Q - 1) ? (N / Q) : (N - N0)
-
-#define KERNEL_PARAMS __shared__ mat2_r u, size_t ldu, __shared__ mat2_r v, size_t ldv
+#define KERNEL_PARAMS mat2_r u, int ldu, mat2_r v, int ldv, DEV_DATA
 
 __global__ void updateBoundaries(KERNEL_PARAMS) {
-	THREAD_LOCALS_LAYOUT(M, N, 1);
-	// Pointer arithmetic to avoid conditionals and warp divergence on invocations, reducing the overall diveregence time
-	ExchangeHandler exCorner = exchangeHandlerAlt(cornerMod(x, y), exchangeBlockCorner);
-	exCorner(x, y, u, ldu, N_loc, M_loc, M0, N0);
-	ExchangeHandler exTopBottom = exchangeHandlerAlt(topBottomMod(x, y), exchangeBlockTopBottom);
-	exTopBottom(x, y, u, ldu, N_loc, M_loc, M0, N0);
-	ExchangeHandler exLeftRight = exchangeHandlerAlt(leftRightMod(x, y), exchangeBlockLeftRight);
-	exLeftRight(x, y, u, ldu, N_loc, M_loc, M0, N0);
+	THREAD_LOCALS_LAYOUT(dev_M, dev_N, 1);
 	COMPILE_COND_T(EXCHANGE,
 		printf(
-			"[%zu] i = %zu, j = %zu, corner: %p, topBottom: %p, leftRight: %p\n",
+			"[%d] y: %d, x: %d, P: %d, Q: %d, M: %d, N: %d, M0: %d, N0: %d, M_loc: %d, N_loc: %d\n",
 			threadId,
-			i, j,
-			(void*) ((uintptr_t) (corner != exchangeNoop) * (uintptr_t) corner),
-			(void*) ((uintptr_t) (topBottom != exchangeNoop) * (uintptr_t) topBottom),
-			(void*) ((uintptr_t) (leftRight != exchangeNoop) * (uintptr_t) leftRight)
+			y, x,
+			P, Q,
+			dev_M, dev_N,
+			M0, N0,
+			M_loc, N_loc
 		);
-	)
+	);
+	// Pointer arithmetic to avoid conditionals and warp divergence on invocations, reducing the overall diveregence time
+	ExchangeHandler exCorner = exchangeHandlerAlt(cornerMod(x, y), exchangeBlockCorner);
+	exCorner(x, y, u, ldu, N_loc, M_loc, M0, N0, FWD_DEV_DATA);
+	ExchangeHandler exTopBottom = exchangeHandlerAlt(topBottomMod(x, y), exchangeBlockTopBottom);
+	exTopBottom(x, y, u, ldu, N_loc, M_loc, M0, N0, FWD_DEV_DATA);
+	ExchangeHandler exLeftRight = exchangeHandlerAlt(leftRightMod(x, y), exchangeBlockLeftRight);
+	exLeftRight(x, y, u, ldu, N_loc, M_loc, M0, N0, FWD_DEV_DATA);
+	COMPILE_COND_T(EXCHANGE,
+		printf(
+			"[%d] i = %d, j = %d, corner: %p, topBottom: %p, leftRight: %p\n",
+			threadId,
+			y, x,
+			(void*) ((uintptr_t) (exCorner != exchangeNoop) * (uintptr_t) exCorner),
+			(void*) ((uintptr_t) (exTopBottom != exchangeNoop) * (uintptr_t) exTopBottom),
+			(void*) ((uintptr_t) (exLeftRight != exchangeNoop) * (uintptr_t) exLeftRight)
+		);
+	);
 	UpdateHandler upCorner = updateHandlerAlt(cornerMod(x, y), updateCorner);
-	upCorner(x, y, u, ldu, N_loc, M_loc, M0, N0);
+	upCorner(x, y, u, ldu, v, ldv, N_loc, M_loc, M0, N0, FWD_DEV_DATA);
 	UpdateHandler upTopBottom = updateHandlerAlt(topBottomMod(x, y), updateTopBottom);
-	upTopBottom(x, y, u, ldu, N_loc, M_loc, M0, N0);
+	upTopBottom(x, y, u, ldu, v, ldv, N_loc, M_loc, M0, N0, FWD_DEV_DATA);
 	UpdateHandler upLeftRight = updateHandlerAlt(leftRightMod(x, y), updateLeftRight);
-	upLeftRight(x, y, u, ldu, N_loc, M_loc, M0, N0);
+	upLeftRight(x, y, u, ldu, v, ldv, N_loc, M_loc, M0, N0, FWD_DEV_DATA);
+	COMPILE_COND_T(EXCHANGE,
+		printf(
+			"[%d] i = %d, j = %d, corner: %p, topBottom: %p, leftRight: %p\n",
+			threadId,
+			y, x,
+			(void*) ((uintptr_t) (upCorner != updateNoop) * (uintptr_t) upCorner),
+			(void*) ((uintptr_t) (upTopBottom != updateNoop) * (uintptr_t) upTopBottom),
+			(void*) ((uintptr_t) (upLeftRight != updateNoop) * (uintptr_t) upLeftRight)
+		);
+	);
+}
+
+__global__ void updateInnerAdvectFieldDeviceSharedMem(KERNEL_PARAMS) {
+	THREAD_LOCALS_LAYOUT(dev_M - 2, dev_N - 2, 2);
+	int globalIdx = x + y * blockDim.x * gridDim.x;
+	int grid_size_y = modAlt(blockIdx.x < gridDim.x - 1, (dev_N - 2) / gridDim.x, (dev_N - 2) - ((dev_N - 2) / gridDim.x) * (gridDim.x - 1));
+	int grid_size_x = modAlt(blockIdx.y < gridDim.y - 1, (dev_M - 2) / gridDim.y, (dev_M - 2) - ((dev_M - 2) / gridDim.y) * (gridDim.y - 1));
+	extern __shared__ double chunk[];
+	mat2 grid_u;
+	cudaMemcpy2DAsync(// Might be better as a standalone kernel, can we implement a faster strided copy?
+		grid_u,
+		grid_size_y,
+		&V(u,M0,N0),
+		dev_M,
+		M_loc,
+		N_loc,
+		cudaMemcpyDeviceToDevice,
+		0 // Default stream, parameterise this according to current stream binding
+	);
+	int ldgrid_u = grid_size_y;
+	int grid_M0 = (grid_size_y / blockDim.y);
+	// TODO: Derive block-local offsets into grid_u
+	updateAdvectField(M_loc, N_loc, &V(grid_u, M0, N0), ldu, &V(v, M0, N0), ldv, dev_Ux, dev_Uy);
 }
 
 __global__ void updateInnerAdvectFieldDevice(KERNEL_PARAMS) {
-	THREAD_LOCALS_LAYOUT(M - 1, N - 1, 2);
-	size_t globalIdx = x + y * blockDim.x * gridDim.x;
-	updateAdvectField(M_loc, N_loc, &V(u, M0, N0), ldu, &V(v, M0, N0), ldv);
+	THREAD_LOCALS_LAYOUT(dev_M - 1, dev_N - 1, 2);
+	int globalIdx = x + y * blockDim.x * gridDim.x;
+	updateAdvectField(M_loc, N_loc, &V(u, M0, N0), ldu, &V(v, M0, N0), ldv, dev_Ux, dev_Uy);
 }
 
 // ... optimized parallel variant
-void cudaOptAdvect(int reps, double *u, int ldu) {
-	size_t ldv = N + 2;
+void cudaOptAdvect(int reps, double *u, int ldu, int w) {
+	int ldv = N + 2;
 	mat2 v;
-	HANDLE_ERROR(cudaMalloc(&v, ldv * (M + 2), sizeof(*v)));
+	HANDLE_ERROR(cudaMalloc(&v, (ldv * (M + 2)) * sizeof(*v)));
 	mat2 uDev;
-	HANDLE_ERROR(cudaMalloc(&uDev, ldv * (M + 2), sizeof(*uDev)));
+	HANDLE_ERROR(cudaMalloc(&uDev, (ldv * (M + 2)) * sizeof(*uDev)));
 	HANDLE_ERROR(cudaMemcpy(uDev, u, ldv * (M + 2) * sizeof(*u), cudaMemcpyHostToDevice));
 	dim3 dimGrid(Gx, Gy);
 	dim3 dimBlock(Bx, By);
@@ -381,14 +443,24 @@ void cudaOptAdvect(int reps, double *u, int ldu) {
 	// in the interleaving of both streams.
 	cudaStream_t boundaryUpdateStream;
 	cudaStream_t innerFieldAdvectionStream;
+	HANDLE_ERROR(cudaStreamCreate(&boundaryUpdateStream));
+	HANDLE_ERROR(cudaStreamCreate(&innerFieldAdvectionStream));
 	dim3 boundaryGrid(boundaryGx, boundaryGy);
 	dim3 boundaryBlock(boundaryBx, boundaryBy);
-	for (size_t r = 0; r < reps; r++) {
-		updateBoundaries<<<boundaryGrid, boundaryBlock, boundaryUpdateStream>>>(uDev, ldu, v, ldv);
-		updateInnerAdvectFieldDevice<<<dimGrid, dimBlock, innerFieldAdvectionStream>>>(uDev, ldu, v, ldv);
+	cudaDeviceSynchronize();
+	for (int r = 0; r < reps; r++) {
+		updateBoundaries<<<boundaryGrid, boundaryBlock, 0, boundaryUpdateStream>>>(uDev, ldu, v, ldv, HOST_DATA);
+		updateInnerAdvectFieldDevice<<<dimGrid, dimBlock, 0, innerFieldAdvectionStream>>>(uDev, ldu, v, ldv, HOST_DATA);
 		cudaDeviceSynchronize(); // Wait for both streams to complete
 		COMPILE_COND_T(SWAP, swap(uDev, v, mat2)); // No need for copies, device pointer swaps are sufficient
 	}
+	COMPILE_COND_T(SWAP,
+		if (reps % 2 != 0) {
+			swap(uDev, v, mat2);
+		}
+	);
+	HANDLE_ERROR(cudaStreamDestroy(boundaryUpdateStream));
+	HANDLE_ERROR(cudaStreamDestroy(innerFieldAdvectionStream));
 	HANDLE_ERROR(cudaMemcpy(u, uDev, ldv * (M + 2) * sizeof(*u), cudaMemcpyDeviceToHost));
 	HANDLE_ERROR(cudaFree(uDev));
 	HANDLE_ERROR(cudaFree(v));

@@ -6,7 +6,7 @@
 HDRS=serAdvect.h parAdvect.h
 OBJS=serAdvect.o parAdvect.o
 PROG=testAdvect
-CCFLAGS=-O3 # -Xptxas -v
+CCFLAGS=-O3 -dc # -Xptxas -v
 
 all: $(PROG) 
 

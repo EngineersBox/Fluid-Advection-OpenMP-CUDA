@@ -128,12 +128,12 @@ static double* laxWendroffKernel;
 	laxWendroffKernel[0] = cim1 * cjm1; \
 	laxWendroffKernel[1] = cim1 * cj0; \
 	laxWendroffKernel[2] = cim1 * cjp1; \
-	laxWendroffKernel[M + 0] = ci0 * cjm1; \
-	laxWendroffKernel[M + 1] = ci0 * cj0; \
-	laxWendroffKernel[M + 2] = ci0 * cjp1; \
-	laxWendroffKernel[(2 * M) + 0] = cip1 * cjm1; \
-	laxWendroffKernel[(2 * M) + 1] = cip1 * cj0; \
-	laxWendroffKernel[(2 * M) + 2] = cip1 * cjp1; \
+	laxWendroffKernel[N + 0] = ci0 * cjm1; \
+	laxWendroffKernel[N + 1] = ci0 * cj0; \
+	laxWendroffKernel[N + 2] = ci0 * cjp1; \
+	laxWendroffKernel[(2 * N) + 0] = cip1 * cjm1; \
+	laxWendroffKernel[(2 * N) + 1] = cip1 * cj0; \
+	laxWendroffKernel[(2 * N) + 2] = cip1 * cjp1; \
 	if (!fftw_init_threads()) { \
 		fprintf(stderr, "FFTW failed to initialise with OpenMP threads"); \
 		exit(1); \
@@ -164,12 +164,12 @@ void initParParams(int M_, int N_, int P_, int Q_, int verb) {
 
 STATIC_INLINE void omp1dUpdateBoundary(mat2 u, int ldu) {
 	int i, j;
-	#pragma omp for private(j)
+	#pragma omp parallel for private(j)
 	for_ru (j, 1, N + 1) { //top and bottom halo
 		V(u, 0, j)   = V(u, M, j);
 		V(u, M+1, j) = V(u, 1, j);
 	}
-	#pragma omp for private(i)
+	#pragma omp parallel for private(i)
 	for_ru (i, 0, M + 2) { //left and right sides of halo 
 		V(u, i, 0) = V(u, i, N);
 		V(u, i, N+1) = V(u, i, 1);
@@ -181,7 +181,7 @@ STATIC_INLINE void omp1dUpdateAdvectField(mat2_r u, int ldu, mat2_r v, int ldv) 
 	double Ux = Velx * dt / deltax, Uy = Vely * dt / deltay;
 	double cim1, ci0, cip1, cjm1, cj0, cjp1;
 	N2Coeff(Ux, &cim1, &ci0, &cip1); N2Coeff(Uy, &cjm1, &cj0, &cjp1);
-	#pragma omp for private(i)
+	#pragma omp parallel for private(i)
 	for_ru (i, 0, M)
 		for_ru (j, 0, N) 
 			V(v,i,j) =
@@ -192,7 +192,7 @@ STATIC_INLINE void omp1dUpdateAdvectField(mat2_r u, int ldu, mat2_r v, int ldv) 
 
 STATIC_INLINE void omp1dCopyField(mat2_r v, int ldv, mat2_r u, int ldu) {
 	int i, j;
-	#pragma omp for private(i)
+	#pragma omp parallel for private(i)
 	for_ru (i, 0, M)
 		for_ru (j, 0, N)
 			V(u,i,j) = V(v,i,j);
@@ -205,12 +205,9 @@ void omp1dAdvect(int reps, mat2 u, int ldu) {
 	mat2 v = calloc(ldv*(M+2), sizeof(*v));
 	assert(v != NULL);
 	for_r (r, 0, reps) {    
-		#pragma omp parallel shared(u,ldu,v,ldv)
-		{
-			omp1dUpdateBoundary(u, ldu);
-			omp1dUpdateAdvectField(&V(u,1,1), ldu, &V(v,1,1), ldv);
-			omp1dCopyField(&V(v,1,1), ldv, &V(u,1,1), ldu);
-		}
+		omp1dUpdateBoundary(u, ldu);
+		omp1dUpdateAdvectField(&V(u,1,1), ldu, &V(v,1,1), ldv);
+		omp1dCopyField(&V(v,1,1), ldv, &V(u,1,1), ldu);
 	} //for (r...)
 	free(v);
 } //omp1dAdvect()
@@ -311,42 +308,45 @@ void omp2dAdvect(int reps, mat2 u, int ldu) {
 	mat2 v = calloc(ldv * (M + 2), sizeof(*v));
 	assert(v != NULL);
 
-	for_ru (r, 0, reps) {
-		#pragma omp parallel for shared(u, ldu, v, ldv) private(i, j) collapse(2)
-		for_ru (i, 0, P) {
-			for_ru (j, 0, Q) {
-				size_t threadId = omp_get_thread_num();
-				size_t P0 = threadId / Q;
-				size_t M0 = ((M / P) * P0) + 1;
-				size_t M_loc = (P0 < P - 1) ? (M / P) : (M - M0);
-				size_t Q0 = threadId % Q;
-				size_t N0 = ((N / Q) * Q0) + 1;
-				size_t N_loc = (Q0 < Q - 1) ? (N / Q) : (N - N0);
-				if ((i) % (P - 1) == 0 && (j) % (Q - 1) == 0) {
-					exchangeBlockCorner(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
-				}
-				if ((i) % (P - 1) != 0 && (j) % (Q - 1) == 0) {
-					exchangeBlockTopBottom(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
-				}
-				if ((i) % (P - 1) == 0 && (j) % (Q - 1) != 0) {
-					exchangeBlockLeftRight(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
-				}
-				COMPILE_COND_T(EXCHANGE,
-					printf(
-						"[%zu] i = %zu, j = %zu, corner: %p, topBottom: %p, leftRight: %p\n",
-						threadId,
-						i, j,
-						(void*) ((uintptr_t) (corner != exchangeNoop) * (uintptr_t) corner),
-						(void*) ((uintptr_t) (topBottom != exchangeNoop) * (uintptr_t) topBottom),
-						(void*) ((uintptr_t) (leftRight != exchangeNoop) * (uintptr_t) leftRight)
+	//#pragma omp parallel shared(u, ldu, v, ldv)
+	//{
+		for_ru (r, 0, reps) {
+			#pragma omp parallel for shared(u, ldu, v, ldv) private(i, j) collapse(2)
+			for_ru (i, 0, P) {
+				for_ru (j, 0, Q) {
+					size_t threadId = omp_get_thread_num();
+					size_t P0 = threadId / Q;
+					size_t M0 = ((M / P) * P0) + 1;
+					size_t M_loc = (P0 < P - 1) ? (M / P) : (M - M0);
+					size_t Q0 = threadId % Q;
+					size_t N0 = ((N / Q) * Q0) + 1;
+					size_t N_loc = (Q0 < Q - 1) ? (N / Q) : (N - N0);
+					if ((i) % (P - 1) == 0 && (j) % (Q - 1) == 0) {
+						exchangeBlockCorner(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
+					}
+					if ((i) % (P - 1) != 0 && (j) % (Q - 1) == 0) {
+						exchangeBlockTopBottom(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
+					}
+					if ((i) % (P - 1) == 0 && (j) % (Q - 1) != 0) {
+						exchangeBlockLeftRight(threadId, i, j, u, ldu, N_loc, M_loc, M0, N0);
+					}
+					COMPILE_COND_T(EXCHANGE,
+						printf(
+							"[%zu] i = %zu, j = %zu, corner: %p, topBottom: %p, leftRight: %p\n",
+							threadId,
+							i, j,
+							(void*) ((uintptr_t) (corner != exchangeNoop) * (uintptr_t) corner),
+							(void*) ((uintptr_t) (topBottom != exchangeNoop) * (uintptr_t) topBottom),
+							(void*) ((uintptr_t) (leftRight != exchangeNoop) * (uintptr_t) leftRight)
+						);
 					);
-				);
-				updateAdvectField(M_loc, N_loc, &V(u, M0, N0), ldu, &V(v, M0, N0), ldv);
-				COMPILE_COND_F(SWAP, copyField(M_loc, N_loc, &V(v, M0, N0), ldv, &V(u, M0, N0), ldu));
+					updateAdvectField(M_loc, N_loc, &V(u, M0, N0), ldu, &V(v, M0, N0), ldv);
+					COMPILE_COND_F(SWAP, copyField(M_loc, N_loc, &V(v, M0, N0), ldv, &V(u, M0, N0), ldu));
+				}
 			}
-		}
-		COMPILE_COND_T(SWAP, swap(u, v, mat2));
-	} //for (r...)
+			COMPILE_COND_T(SWAP, swap(u, v, mat2));
+		} //for (r...)
+	//}
 	COMPILE_COND_T(SWAP,
 		if (reps % 2 != 0) {
 			swap(u, v, double*);
@@ -359,30 +359,31 @@ void omp2dAdvect(int reps, mat2 u, int ldu) {
 void repeatedSquaring(int timesteps, fftw_complex* a_complex, size_t n) {
 	bool initialised = false;
 	int t = timesteps;
+	size_t i;
 	CHECK_ALLOC(fftw_complex*, odd_mults, fftw_alloc_complex(n));
 	#pragma omp parallel
 	{
 		while (t > 1) {
 			if (t & 1) {
 				if (!initialised) {
-					memcpy(odd_mults, a_complex, n);
+					memcpy(odd_mults, a_complex, n * sizeof(fftw_complex));
 					initialised = true;
 				} else {
 					#pragma omp for private(i)
-					for_r (i, 0, n) {
+					for_ru (i, 0, n) {
 						odd_mults[i] *= a_complex[i];
 					}
 				}
 			}
 			#pragma omp for private(i)
-			for_r (i, 0, n) {
+			for_ru (i, 0, n) {
 				a_complex[i] *= a_complex[i];
 			}
-			t /= 2;
+			t >>= 1;
 		}
 		if (initialised) {
 			#pragma omp for private(i)
-			for_r (i, 0, n) {
+			for_ru (i, 0, n) {
 				a_complex[i] *= odd_mults[i];
 			}
 		}
@@ -395,6 +396,7 @@ void repeatedSquaring(int timesteps, fftw_complex* a_complex, size_t n) {
 void ompAdvectExtra(int r, mat2 u, int ldu) {
 #if FFT_CONV_KERNEL == 1
 	size_t timesteps = r;
+	size_t i, j;
 
 	// FFT Forward
 	CHECK_ALLOC(fftw_complex*, a_complex, fftw_alloc_complex(fieldSize));
@@ -414,21 +416,24 @@ void ompAdvectExtra(int r, mat2 u, int ldu) {
 
 	// Combine kernel & rep-squared evolution
 	#pragma omp parallel for private(i) shared(a_complex, input_complex)
-	for_r (i, 0, fieldSize) {
+	for_ru (i, 0, fieldSize) {
 		a_complex[i] *= input_complex[i];
 	}
 
 	// FFT Backward
-	CHECK_ALLOC(mat2, result, calloc(fieldSize, sizeof(*result)));
-	fftw_plan plan_result = fftw_plan_dft_c2r_2d(M, N, a_complex, result, FFTW_BACKWARD | FFTW_ESTIMATE);
+	CHECK_ALLOC(mat2, v, calloc(fieldSize, sizeof(*v)));
+	size_t ldv = ldu;
+	fftw_plan plan_result = fftw_plan_dft_c2r_2d(M, N, a_complex, v, FFTW_BACKWARD | FFTW_ESTIMATE);
 	fftw_execute(plan_result);
 	fftw_destroy_plan(plan_result);
 
 	// Rotate result
-	#pragma omp parallel for private(i,j) shared(u, result, timesteps, M, N) collapse(2)
-	for_r (i, 0, M) {
-		for_r (j, 0, N) {
-			V(u, i, j) = result[((i + (timesteps % M)) % M) + (((j + (timesteps % N)) % N) * M)];
+	#pragma omp parallel for private(i,j) shared(u, v, timesteps, M, N, ldu, ldv) collapse(2)
+	for_ru (i, 0, M) {
+		for_ru (j, 0, N) {
+			size_t newI = (i + (timesteps % M)) % M;
+			size_t newJ = (j + (timesteps % N)) % N;
+			V(u, i, j) = V(v, newI, newJ) / (M * N);
 		}
 	}
 
