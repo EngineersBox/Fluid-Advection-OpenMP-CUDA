@@ -18,8 +18,8 @@ endif
 all: $(PROG) 
 
 %: %.o $(OBJS)
-	gcc -o $* $*.o $(OBJS) $(LINKERFLAGS) -lgomp -lm
+	gcc-13 -o $* $*.o $(OBJS) $(LINKERFLAGS) -lgomp -lm
 %.o: %.c $(HDRS)
-	gcc -Wall $(CCFLAGS) -c $*.c
+	gcc-13 -Wall $(CCFLAGS) -c $*.c
 clean:
 	rm -f *.o $(PROG)

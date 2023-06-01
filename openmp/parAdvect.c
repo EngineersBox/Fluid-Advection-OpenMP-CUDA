@@ -182,20 +182,24 @@ STATIC_INLINE void omp1dUpdateAdvectField(mat2_r u, int ldu, mat2_r v, int ldv) 
 	double cim1, ci0, cip1, cjm1, cj0, cjp1;
 	N2Coeff(Ux, &cim1, &ci0, &cip1); N2Coeff(Uy, &cjm1, &cj0, &cjp1);
 	#pragma omp parallel for private(i)
-	for_ru (i, 0, M)
-		for_ru (j, 0, N) 
+	for_ru (i, 0, M) {
+		for_ru (j, 0, N) {
 			V(v,i,j) =
 				cim1*(cjm1*V(u,i-1,j-1) + cj0*V(u,i-1,j) + cjp1*V(u,i-1,j+1)) +
 				ci0 *(cjm1*V(u,i  ,j-1) + cj0*V(u,i,  j) + cjp1*V(u,i,  j+1)) +
 				cip1*(cjm1*V(u,i+1,j-1) + cj0*V(u,i+1,j) + cjp1*V(u,i+1,j+1));
+		}
+	}
 } //omp1dUpdateAdvectField()  
 
 STATIC_INLINE void omp1dCopyField(mat2_r v, int ldv, mat2_r u, int ldu) {
 	int i, j;
 	#pragma omp parallel for private(i)
-	for_ru (i, 0, M)
-		for_ru (j, 0, N)
+	for_ru (i, 0, M) {
+		for_ru (j, 0, N) {
 			V(u,i,j) = V(v,i,j);
+		}
+	}
 } //omp1dCopyField()
 
 // evolve advection over reps timesteps, with (u,ldu) containing the field
@@ -308,10 +312,10 @@ void omp2dAdvect(int reps, mat2 u, int ldu) {
 	mat2 v = calloc(ldv * (M + 2), sizeof(*v));
 	assert(v != NULL);
 
-	//#pragma omp parallel shared(u, ldu, v, ldv)
-	//{
+	#pragma omp parallel shared(u, ldu, v, ldv) private(i, j)
+	{
 		for_ru (r, 0, reps) {
-			#pragma omp parallel for shared(u, ldu, v, ldv) private(i, j) collapse(2)
+			#pragma omp for collapse(2)
 			for_ru (i, 0, P) {
 				for_ru (j, 0, Q) {
 					size_t threadId = omp_get_thread_num();
@@ -344,12 +348,16 @@ void omp2dAdvect(int reps, mat2 u, int ldu) {
 					COMPILE_COND_F(SWAP, copyField(M_loc, N_loc, &V(v, M0, N0), ldv, &V(u, M0, N0), ldu));
 				}
 			}
-			COMPILE_COND_T(SWAP, swap(u, v, mat2));
+			#pragma omp barrier
+			#pragma omp single
+			{
+				COMPILE_COND_T(SWAP, swap(u, v, mat2));
+			}
 		} //for (r...)
-	//}
+	}
 	COMPILE_COND_T(SWAP,
 		if (reps % 2 != 0) {
-			swap(u, v, double*);
+			swap(u, v, mat2);
 		}
 	);
 	free(v);
@@ -390,6 +398,8 @@ void repeatedSquaring(int timesteps, fftw_complex* a_complex, size_t n) {
 	}
 	fftw_free(odd_mults);
 }
+
+#define fftw_execute_destroy_plan(plan) fftw_execute(plan); fftw_destroy_plan(plan)
 #endif
 
 // ... extra optimization variant
@@ -402,8 +412,7 @@ void ompAdvectExtra(int r, mat2 u, int ldu) {
 	CHECK_ALLOC(fftw_complex*, a_complex, fftw_alloc_complex(fieldSize));
 	memset(a_complex, 0, sizeof(fftw_complex) * fieldSize);
 	fftw_plan plan_u_f = fftw_plan_dft_r2c_2d(M, N, u, a_complex, FFTW_ESTIMATE);
-	fftw_execute(plan_u_f);
-	fftw_destroy_plan(plan_u_f);
+	fftw_execute_destroy_plan(plan_u_f);
 	
 	// Repeated squaring
 	repeatedSquaring(timesteps, a_complex, fieldSize);
@@ -411,8 +420,7 @@ void ompAdvectExtra(int r, mat2 u, int ldu) {
 	// FFT Forward
 	CHECK_ALLOC(fftw_complex*, input_complex, fftw_alloc_complex(fieldSize));
 	fftw_plan plan_lwk_f = fftw_plan_dft_r2c_2d(M, N, laxWendroffKernel, input_complex, FFTW_ESTIMATE);
-	fftw_execute(plan_lwk_f);
-	fftw_destroy_plan(plan_lwk_f);
+	fftw_execute_destroy_plan(plan_lwk_f);
 
 	// Combine kernel & rep-squared evolution
 	#pragma omp parallel for private(i) shared(a_complex, input_complex)
@@ -424,8 +432,7 @@ void ompAdvectExtra(int r, mat2 u, int ldu) {
 	CHECK_ALLOC(mat2, v, calloc(fieldSize, sizeof(*v)));
 	size_t ldv = ldu;
 	fftw_plan plan_result = fftw_plan_dft_c2r_2d(M, N, a_complex, v, FFTW_BACKWARD | FFTW_ESTIMATE);
-	fftw_execute(plan_result);
-	fftw_destroy_plan(plan_result);
+	fftw_execute_destroy_plan(plan_result);
 
 	// Rotate result
 	#pragma omp parallel for private(i,j) shared(u, v, timesteps, M, N, ldu, ldv) collapse(2)
