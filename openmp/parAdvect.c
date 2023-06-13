@@ -181,7 +181,7 @@ STATIC_INLINE void omp1dUpdateAdvectField(mat2_r u, int ldu, mat2_r v, int ldv) 
 	double Ux = Velx * dt / deltax, Uy = Vely * dt / deltay;
 	double cim1, ci0, cip1, cjm1, cj0, cjp1;
 	N2Coeff(Ux, &cim1, &ci0, &cip1); N2Coeff(Uy, &cjm1, &cj0, &cjp1);
-	#pragma omp parallel for private(i)
+	#pragma omp parallel for simd private(i)
 	for_ru (i, 0, M) {
 		for_ru (j, 0, N) {
 			V(v,i,j) =
@@ -194,7 +194,7 @@ STATIC_INLINE void omp1dUpdateAdvectField(mat2_r u, int ldu, mat2_r v, int ldv) 
 
 STATIC_INLINE void omp1dCopyField(mat2_r v, int ldv, mat2_r u, int ldu) {
 	int i, j;
-	#pragma omp parallel for private(i)
+	#pragma omp parallel for simd private(i)
 	for_ru (i, 0, M) {
 		for_ru (j, 0, N) {
 			V(u,i,j) = V(v,i,j);
@@ -356,7 +356,7 @@ void omp2dAdvect(int reps, mat2 u, int ldu) {
 		} //for (r...)
 	}
 	COMPILE_COND_T(SWAP,
-		if (reps % 2 != 0) {
+		if (reps % 2 == 0) {
 			swap(u, v, mat2);
 		}
 	);
@@ -369,7 +369,7 @@ void repeatedSquaring(int timesteps, fftw_complex* a_complex, size_t n) {
 	int t = timesteps;
 	size_t i;
 	CHECK_ALLOC(fftw_complex*, odd_mults, fftw_alloc_complex(n));
-	#pragma omp parallel
+	#pragma omp parallel default(shared)
 	{
 		while (t > 1) {
 			if (t & 1) {
@@ -377,20 +377,20 @@ void repeatedSquaring(int timesteps, fftw_complex* a_complex, size_t n) {
 					memcpy(odd_mults, a_complex, n * sizeof(fftw_complex));
 					initialised = true;
 				} else {
-					#pragma omp for private(i)
+					#pragma omp for simd private(i)
 					for_ru (i, 0, n) {
 						odd_mults[i] *= a_complex[i];
 					}
 				}
 			}
-			#pragma omp for private(i)
+			#pragma omp for simd private(i)
 			for_ru (i, 0, n) {
 				a_complex[i] *= a_complex[i];
 			}
 			t >>= 1;
 		}
 		if (initialised) {
-			#pragma omp for private(i)
+			#pragma omp for simd private(i)
 			for_ru (i, 0, n) {
 				a_complex[i] *= odd_mults[i];
 			}
@@ -423,7 +423,7 @@ void ompAdvectExtra(int r, mat2 u, int ldu) {
 	fftw_execute_destroy_plan(plan_lwk_f);
 
 	// Combine kernel & rep-squared evolution
-	#pragma omp parallel for private(i) shared(a_complex, input_complex)
+	#pragma omp parallel for simd private(i) shared(a_complex, input_complex)
 	for_ru (i, 0, fieldSize) {
 		a_complex[i] *= input_complex[i];
 	}
