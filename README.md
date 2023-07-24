@@ -5,7 +5,7 @@ Parallel advection solver over shared address space programming models. Programm
 
 ## Setup
 
-This project contains a report called `ps-ass2Rep.pdf`,  which discusses questions posed in <./docs/assignment_outline.md>. It also contains two sub-directories, `openmp` and `cuda`. The former contains a test program `testAdvect.c`, a file `serAdvect.c` containing serial advection functions, some header files, and a template OpenMP advection solver `parAdvect.c`. The test program can be built using the command `make`.
+This project contains a report called `ps-ass2Rep.pdf`,  which discusses questions posed in [docs/assignment_outline.md](./docs/assignment_outline.md). It also contains two sub-directories, `openmp` and `cuda`. The former contains a test program `testAdvect.c`, a file `serAdvect.c` containing serial advection functions, some header files, and a template OpenMP advection solver `parAdvect.c`. The test program can be built using the command `make`.
 
 The usage for the test program is:
 
